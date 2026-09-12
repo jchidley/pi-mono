@@ -115,7 +115,7 @@
 - Exported extension hook event and result types that were previously omitted from the package entry points ([#9642](https://github.com/earendil-works/pi/pull/9642)).
 - Added `/bug [description]` to report a bug to the Pi developers. The report bundles environment, model, provider, extension, and settings metadata (secrets redacted), assistant message diagnostics from the session, optionally the session transcript, or a model-written summary of what went wrong instead. It is uploaded to Radius (no login required; attributed when logged in) or exported as a zip archive, and the report id is recorded in the session as a `pi.bug-report` entry. Crashes are recorded in `~/.pi/agent/crashes.json`, announced once on the next start, and attached to the next report; unexplained errors and exhausted retries point at `/bug` once per session.
 - Added cost-aware prompt-cache warming during long tool runs and optionally while idle, with configurable modes, model cache-lifetime metadata, `/session` diagnostics, transcript notices, and the `cache_warming_decision` extension event. See [Cache Warming](docs/settings.md#cache-warming) ([#9668](https://github.com/earendil-works/pi/pull/9668)).
-- Added `/focus` and the optional unbound `app.transcript.toggleFinalOnly` action for an idle-only, temporary transcript view containing user messages and final assistant responses.
+- Added `/focus` and the optional unbound `app.transcript.toggleFinalOnly` action for a temporary transcript view containing user messages and final assistant responses; it can be toggled while responses, tools, compaction, or bash commands are active.
 
 ### Changed
 

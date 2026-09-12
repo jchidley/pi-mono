@@ -201,11 +201,11 @@ describe("focused transcript filtering", () => {
 		expect(shouldShowInFocusedTranscript(toolTurn)).toBe(false);
 	});
 
-	test("toggles only while idle, mounts feedback after the pure transcript, and restores ordinary output", () => {
+	test("toggles both ways during assistant streaming and preserves partial ordinary output", () => {
 		const header = new Text("HEADER", 0, 0);
 		const loaded = new Text("LOADED", 0, 0);
 		const ordinary = new Container();
-		ordinary.addChild(new Text("ORDINARY", 0, 0));
+		ordinary.addChild(new Text("PARTIAL_ASSISTANT_OUTPUT", 0, 0));
 		const focused = new Container();
 		focused.addChild(new Text("PURE_TRANSCRIPT", 0, 0));
 		const feedback = new Container();
@@ -220,43 +220,27 @@ describe("focused transcript filtering", () => {
 			loadedResourcesContainer: loaded,
 			chatContainer: ordinary,
 			documentContainer: document,
-			bashCommandRunning: false,
-			runtimeHost: { session: { isIdle: true, isBashRunning: false } },
+			runtimeHost: { session: { isIdle: false, isStreaming: true } },
 			ui: { requestRender: vi.fn() },
 			rebuildFocusedTranscriptIfActive,
 			updatePendingMessagesDisplay,
 		});
-		const prototype = InteractiveMode.prototype as unknown as {
-			toggleFocusedTranscript(this: typeof context): void;
-		};
+		const toggle = (
+			InteractiveMode.prototype as unknown as {
+				toggleFocusedTranscript(this: typeof context): void;
+			}
+		).toggleFocusedTranscript;
 
-		prototype.toggleFocusedTranscript.call(context);
+		toggle.call(context);
 		expect(context.focusedTranscript).toBe(true);
 		expect(document.children).toEqual([header, focused, feedback]);
 		expect(rebuildFocusedTranscriptIfActive).toHaveBeenCalledOnce();
 
-		context.runtimeHost.session.isIdle = false;
-		prototype.toggleFocusedTranscript.call(context);
-		expect(context.focusedTranscript).toBe(true);
-		expect(render(focused).trimEnd()).toBe("PURE_TRANSCRIPT");
-		expect(render(feedback)).toContain(
-			"Wait for the current response, compaction, or bash command to finish before changing transcript mode.",
-		);
-
-		context.runtimeHost.session.isIdle = true;
-		prototype.toggleFocusedTranscript.call(context);
+		toggle.call(context);
 		expect(context.focusedTranscript).toBe(false);
 		expect(document.children).toEqual([header, loaded, ordinary]);
-		expect(feedback.children).toHaveLength(0);
-		expect(render(ordinary)).toContain("ORDINARY");
+		expect(render(ordinary)).toContain("PARTIAL_ASSISTANT_OUTPUT");
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(2);
-
-		context.bashCommandRunning = true;
-		prototype.toggleFocusedTranscript.call(context);
-		expect(context.focusedTranscript).toBe(false);
-		expect(render(ordinary)).toContain(
-			"Wait for the current response, compaction, or bash command to finish before changing transcript mode.",
-		);
 	});
 
 	test("keeps the focused transcript stable across the full live event lifecycle using persisted entries", async () => {
@@ -293,6 +277,9 @@ describe("focused transcript filtering", () => {
 		Object.assign(context, {
 			isInitialized: true,
 			chatContainer: new Container(),
+			headerContainer: new Container(),
+			loadedResourcesContainer: new Container(),
+			documentContainer: new Container(),
 			footer: { invalidate: vi.fn() },
 			runtimeHost: {
 				session: {
@@ -316,11 +303,10 @@ describe("focused transcript filtering", () => {
 			maybeShowCacheMissNotice: vi.fn(),
 			clearStatusIndicator: vi.fn(),
 		});
-		const handleEvent = (
-			InteractiveMode.prototype as unknown as {
-				handleEvent(this: typeof context, event: AgentSessionEvent): Promise<void>;
-			}
-		).handleEvent;
+		const { handleEvent, toggleFocusedTranscript: toggle } = InteractiveMode.prototype as unknown as {
+			handleEvent(this: typeof context, event: AgentSessionEvent): Promise<void>;
+			toggleFocusedTranscript(this: typeof context): void;
+		};
 		context.focusedFeedbackContainer.addChild(new Text("STALE_FEEDBACK", 0, 0));
 		const liveUser = user("LIVE_USER");
 		const toolTurn = assistant(
@@ -343,6 +329,47 @@ describe("focused transcript filtering", () => {
 		expect(render(context.focusedTranscriptContainer)).not.toContain("HIDDEN_LIVE_TOOL_TURN");
 
 		await handleEvent.call(context, { type: "message_end", message: toolTurn });
+		persistedEntries = messageEntries([liveUser, toolTurn]);
+		await handleEvent.call(context, {
+			type: "tool_execution_start",
+			toolCallId: "live-tool",
+			toolName: "read",
+			args: { path: "secret" },
+		});
+		const liveTool = context.pendingTools.get("live-tool");
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(false);
+		await handleEvent.call(context, {
+			type: "tool_execution_update",
+			toolCallId: "live-tool",
+			toolName: "read",
+			args: { path: "secret" },
+			partialResult: { content: [{ type: "text", text: "PARTIAL_TOOL_OUTPUT" }], details: {} },
+		});
+		expect(render(context.chatContainer)).toContain("PARTIAL_TOOL_OUTPUT");
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(true);
+		await handleEvent.call(context, {
+			type: "tool_execution_update",
+			toolCallId: "live-tool",
+			toolName: "read",
+			args: { path: "secret" },
+			partialResult: { content: [{ type: "text", text: "UPDATED_TOOL_OUTPUT" }], details: {} },
+		});
+		expect(context.pendingTools.get("live-tool")).toBe(liveTool);
+		expect(render(context.focusedTranscriptContainer)).not.toContain("UPDATED_TOOL_OUTPUT");
+		toggle.call(context);
+		expect(render(context.chatContainer)).toContain("UPDATED_TOOL_OUTPUT");
+		await handleEvent.call(context, {
+			type: "tool_execution_end",
+			toolCallId: "live-tool",
+			toolName: "read",
+			isError: false,
+			result: { content: [{ type: "text", text: "COMPLETED_TOOL_OUTPUT" }], details: {} },
+		});
+		expect(context.pendingTools.size).toBe(0);
+		expect(render(context.chatContainer)).toContain("COMPLETED_TOOL_OUTPUT");
+		toggle.call(context);
 		const partialFinal = assistant([{ type: "text", text: "HIDDEN_STREAMING_FINAL" }], "pending");
 		await handleEvent.call(context, { type: "message_start", message: partialFinal });
 		await handleEvent.call(context, {
@@ -357,6 +384,13 @@ describe("focused transcript filtering", () => {
 		});
 		expect(render(context.focusedTranscriptContainer)).not.toContain("HIDDEN_STREAMING_FINAL");
 
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(false);
+		expect(render(context.chatContainer)).toContain("HIDDEN_STREAMING_FINAL");
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(true);
+		expect(render(context.focusedTranscriptContainer)).not.toContain("HIDDEN_STREAMING_FINAL");
+
 		const finalTurn = assistant(
 			[
 				{ type: "thinking", thinking: "HIDDEN_LIVE_THINKING" },
@@ -365,7 +399,12 @@ describe("focused transcript filtering", () => {
 			"stop",
 		);
 		await handleEvent.call(context, { type: "message_end", message: finalTurn });
+		expect(render(context.focusedTranscriptContainer).match(/VISIBLE_LIVE_FINAL/g)).toHaveLength(1);
 		persistedEntries = messageEntries([liveUser, toolTurn, finalTurn]);
+		toggle.call(context);
+		expect(render(context.chatContainer).match(/VISIBLE_LIVE_FINAL/g)).toHaveLength(1);
+		toggle.call(context);
+		expect(render(context.focusedTranscriptContainer).match(/VISIBLE_LIVE_FINAL/g)).toHaveLength(1);
 		await handleEvent.call(context, {
 			type: "agent_end",
 			messages: [liveUser, toolTurn, finalTurn],
@@ -381,7 +420,11 @@ describe("focused transcript filtering", () => {
 		expect(output).not.toContain("HIDDEN_LIVE_THINKING");
 	});
 
-	test("keeps deferred bash output hidden while focused and restores it when ordinary mode returns", async () => {
+	test("toggles during normal bash streaming while preserving its ordinary output", async () => {
+		let finishBash!: () => void;
+		const bashFinished = new Promise<void>((resolve) => {
+			finishBash = resolve;
+		});
 		const pending = new Container();
 		const chat = new Container();
 		const focused = new Container();
@@ -389,10 +432,11 @@ describe("focused transcript filtering", () => {
 		const session = {
 			isStreaming: true,
 			isIdle: false,
-			isBashRunning: false,
+			isBashRunning: true,
 			extensionRunner: { emitUserBash: vi.fn(async () => undefined) },
 			executeBash: vi.fn(async (_command: string, onOutput: (chunk: string) => void) => {
 				onOutput("BASH_STREAM_SECRET");
+				await bashFinished;
 				return { output: "BASH_STREAM_SECRET", exitCode: 0, cancelled: false, truncated: false };
 			}),
 			getSteeringMessages: () => [],
@@ -403,7 +447,7 @@ describe("focused transcript filtering", () => {
 			},
 		};
 		const context = Object.assign(Object.create(InteractiveMode.prototype), {
-			focusedTranscript: true,
+			focusedTranscript: false,
 			focusedTranscriptContainer: focused,
 			focusedFeedbackContainer: new Container(),
 			pendingMessagesContainer: pending,
@@ -426,19 +470,22 @@ describe("focused transcript filtering", () => {
 			toggleFocusedTranscript(this: typeof context): void;
 		};
 
-		await prototype.handleBashCommand.call(context, "echo secret");
-		expect(render(pending)).not.toContain("BASH_STREAM_SECRET");
+		const commandPromise = prototype.handleBashCommand.call(context, "echo secret");
+		await vi.waitFor(() => expect(render(pending)).toContain("BASH_STREAM_SECRET"));
+		prototype.toggleFocusedTranscript.call(context);
+		expect(context.focusedTranscript).toBe(true);
 		expect(render(focused)).not.toContain("BASH_STREAM_SECRET");
+		expect(render(pending)).not.toContain("BASH_STREAM_SECRET");
 
-		session.isStreaming = false;
-		session.isIdle = true;
 		prototype.toggleFocusedTranscript.call(context);
 		expect(context.focusedTranscript).toBe(false);
 		expect(render(pending)).toContain("$ echo secret");
 		expect(render(pending)).toContain("BASH_STREAM_SECRET");
+		finishBash();
+		await commandPromise;
 	});
 
-	test("blocks transcript toggles while an asynchronous user_bash hook is pending", async () => {
+	test("toggles while an asynchronous user_bash hook is pending", async () => {
 		let releaseHook!: (value: {
 			result: { output: string; exitCode: number; cancelled: boolean; truncated: boolean };
 		}) => void;
@@ -484,14 +531,19 @@ describe("focused transcript filtering", () => {
 		const commandPromise = prototype.handleBashCommand.call(context, "hooked");
 		expect(context.bashCommandRunning).toBe(true);
 		prototype.toggleFocusedTranscript.call(context);
+		expect(context.focusedTranscript).toBe(false);
+		prototype.toggleFocusedTranscript.call(context);
 		expect(context.focusedTranscript).toBe(true);
-		expect(render(focused).trimEnd()).toBe("PURE_TRANSCRIPT");
-		expect(render(feedback)).toContain("Wait for the current response");
+		expect(render(focused)).not.toContain("hook output");
+		expect(feedback.children).toHaveLength(0);
 
 		releaseHook({ result: { output: "hook output", exitCode: 0, cancelled: false, truncated: false } });
 		await commandPromise;
 		expect(context.bashCommandRunning).toBe(false);
 		expect(session.recordBashResult).toHaveBeenCalledOnce();
+		expect(render(context.documentContainer)).not.toContain("hook output");
+		prototype.toggleFocusedTranscript.call(context);
+		expect(render(context.documentContainer)).toContain("hook output");
 	});
 
 	test("shows only the latest operational error or warning outside the focused conversation", () => {
@@ -633,17 +685,18 @@ describe("focused transcript filtering", () => {
 		expect(sessionFeedback).not.toContain("Keyboard Shortcuts");
 	});
 
-	test("rebuilds focused output whenever ordinary chat is rebuilt", () => {
+	test("toggles during compaction and rebuilds both views on completion and reload", async () => {
 		const entries = messageEntries([
 			user("REBUILT_USER"),
 			assistant([{ type: "text", text: "REBUILT_FINAL" }], "stop"),
 		]);
 		const context = createFocusedContext(entries) as unknown as {
+			focusedTranscript: boolean;
 			focusedTranscriptContainer: Container;
 			chatContainer: Container;
 			runtimeHost: {
 				session: {
-					settingsManager: { getShowCacheMissNotices(): boolean };
+					settingsManager: { getShowCacheMissNotices(): boolean; getShowTerminalProgress(): boolean };
 					modelRuntime: object;
 					sessionManager: {
 						buildContextEntries(): SessionEntry[];
@@ -655,17 +708,61 @@ describe("focused transcript filtering", () => {
 		};
 		context.focusedTranscriptContainer.addChild(new Text("STALE_FOCUSED_OUTPUT", 0, 0));
 		Object.assign(context.runtimeHost.session, {
-			settingsManager: { getShowCacheMissNotices: () => false },
+			settingsManager: { getShowCacheMissNotices: () => false, getShowTerminalProgress: () => false },
 			modelRuntime: {},
+			isIdle: false,
+			isCompacting: true,
+		});
+		Object.assign(context, {
+			isInitialized: true,
+			headerContainer: new Container(),
+			loadedResourcesContainer: new Container(),
+			documentContainer: new Container(),
+			defaultEditor: { onEscape: vi.fn() },
+			footer: { invalidate: vi.fn() },
+			showStatusIndicator: vi.fn(),
+			clearStatusIndicator: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+			flushCompactionQueue: vi.fn(),
 		});
 		context.pendingTools = new Map();
+		const { handleEvent, toggleFocusedTranscript: toggle } = InteractiveMode.prototype as unknown as {
+			handleEvent(this: typeof context, event: AgentSessionEvent): Promise<void>;
+			toggleFocusedTranscript(this: typeof context): void;
+		};
+		await handleEvent.call(context, { type: "compaction_start", reason: "manual" });
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(false);
+		toggle.call(context);
+		expect(context.focusedTranscript).toBe(true);
+		context.chatContainer.addChild(new Text("STALE_ORDINARY_OUTPUT", 0, 0));
+		context.focusedTranscriptContainer.addChild(new Text("STALE_FOCUSED_OUTPUT", 0, 0));
+		const result = { summary: "COMPACTION_SUMMARY", tokensBefore: 100, firstKeptEntryId: "entry-0" };
+		entries.unshift({
+			type: "compaction",
+			id: "compaction-entry",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			...result,
+		});
+		await handleEvent.call(context, {
+			type: "compaction_end",
+			reason: "manual",
+			result,
+			aborted: false,
+			willRetry: false,
+		});
+		expect(render(context.chatContainer)).toContain("Compacted from 100 tokens");
+		expect(render(context.chatContainer)).not.toContain("STALE_ORDINARY_OUTPUT");
+		expect(render(context.chatContainer)).toContain("REBUILT_FINAL");
+		expect(render(context.focusedTranscriptContainer)).not.toContain("Compacted from");
+		expect(render(context.focusedTranscriptContainer)).not.toContain("COMPACTION_SUMMARY");
 
 		const rebuild = (
 			InteractiveMode.prototype as unknown as {
 				rebuildChatFromMessages(this: typeof context): void;
 			}
 		).rebuildChatFromMessages;
-		rebuild.call(context);
 
 		const output = render(context.focusedTranscriptContainer);
 		expect(output).toContain("REBUILT_USER");

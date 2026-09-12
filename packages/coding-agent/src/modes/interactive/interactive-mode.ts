@@ -274,7 +274,7 @@ export function isCompletedFinalAssistantMessage(message: AgentMessage): message
 export function shouldShowInFocusedTranscript(
 	item: RenderSessionItem,
 ): item is Extract<AgentMessage, { role: "user" }> | CompletedFinalAssistantMessage {
-	if (isCustomSessionEntry(item) || isCompactionCostNotice(item)) return false;
+	if (isCustomSessionEntry(item) || isUsageSessionEntry(item) || isCompactionCostNotice(item)) return false;
 	return item.role === "user" || isCompletedFinalAssistantMessage(item);
 }
 
@@ -4518,13 +4518,6 @@ export class InteractiveMode {
 	}
 
 	private toggleFocusedTranscript(): void {
-		if (!this.session.isIdle || this.session.isBashRunning || this.bashCommandRunning) {
-			const message =
-				"Wait for the current response, compaction, or bash command to finish before changing transcript mode.";
-			this.showStatus(message);
-			return;
-		}
-
 		this.focusedFeedbackContainer.clear();
 		this.focusedTranscript = !this.focusedTranscript;
 		if (this.focusedTranscript) {
@@ -6781,7 +6774,7 @@ export class InteractiveMode {
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
-| \`${toggleFinalOnlyTranscript}\` | Toggle final-only transcript (idle only) |
+| \`${toggleFinalOnlyTranscript}\` | Toggle final-only transcript |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${copyMessage}\` | Copy selection or last assistant message |
 | \`${followUp}\` | Queue follow-up message |
@@ -6888,7 +6881,6 @@ export class InteractiveMode {
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		this.bashCommandRunning = true;
 		try {
-			// Include asynchronous extension interception in the idle-only toggle guard.
 			const eventResult = await this.session.extensionRunner.emitUserBash({
 				type: "user_bash",
 				command,
