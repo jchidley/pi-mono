@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { BUILTIN_SLASH_COMMANDS } from "../src/core/slash-commands.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type SubmitContext = {
+	focusedFeedbackContainer: { clear: () => void };
+	ui: { requestRender: () => void };
 	defaultEditor: { onSubmit?: (text: string) => void };
 	editor: {
 		addToHistory?: (text: string) => void;
@@ -38,6 +41,8 @@ const interactiveModePrototype = InteractiveMode.prototype as unknown as Interac
 
 function createSubmitContext(): SubmitContext {
 	return {
+		focusedFeedbackContainer: { clear: vi.fn() },
+		ui: { requestRender: vi.fn() },
 		defaultEditor: {},
 		editor: {
 			addToHistory: vi.fn(),
@@ -55,6 +60,26 @@ function createSubmitContext(): SubmitContext {
 }
 
 describe("InteractiveMode startup input", () => {
+	it.each(["idle", "streaming", "compacting", "bash"])(
+		"routes /focus to the guarded display toggle while %s, never to the model",
+		async (state) => {
+			const context = { ...createSubmitContext(), toggleFocusedTranscript: vi.fn() };
+			context.session.isStreaming = state === "streaming";
+			context.session.isCompacting = state === "compacting";
+			context.session.isBashRunning = state === "bash";
+			interactiveModePrototype.setupEditorSubmitHandler.call(context);
+
+			await context.defaultEditor.onSubmit?.(" /focus ");
+
+			expect(context.toggleFocusedTranscript).toHaveBeenCalledOnce();
+			expect(context.editor.setText).toHaveBeenCalledWith("");
+			expect(context.session.prompt).not.toHaveBeenCalled();
+			expect(context.pendingUserInputs).toEqual([]);
+			expect(context.flushPendingBashComponents).not.toHaveBeenCalled();
+			expect(BUILTIN_SLASH_COMMANDS.some((command) => command.name === "focus")).toBe(true);
+		},
+	);
+
 	it("restores a prompt submitted while managed-tool setup is running", () => {
 		const context: StartupSubmitContext = {
 			editor: { setText: vi.fn() },

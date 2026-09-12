@@ -8,6 +8,18 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
+/** Failure wording shared by the ordinary message and focused-view feedback. */
+export function formatAssistantMessageFailure(message: AssistantMessage): string | undefined {
+	if (message.stopReason === "length") return "Response was truncated before completion.";
+	if (message.stopReason === "aborted") {
+		return message.errorMessage && message.errorMessage !== "Request was aborted"
+			? message.errorMessage
+			: "Operation aborted";
+	}
+	if (message.stopReason === "error") return `Error: ${message.errorMessage || "Unknown error"}`;
+	return undefined;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -179,24 +191,10 @@ export class AssistantMessageComponent extends Container {
 		// Length stops can happen before a tool call is complete, so surface them here too.
 		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
 		this.hasToolCalls = hasToolCalls;
-		if (message.stopReason === "length") {
+		const failure = formatAssistantMessageFailure(message);
+		if (failure && (!hasToolCalls || message.stopReason === "length")) {
 			this.contentContainer.addChild(new Spacer(1));
-			this.contentContainer.addChild(
-				new Text(theme.fg("error", "Response was truncated before completion."), this.outputPad, 0),
-			);
-		} else if (!hasToolCalls) {
-			if (message.stopReason === "aborted") {
-				const abortMessage =
-					message.errorMessage && message.errorMessage !== "Request was aborted"
-						? message.errorMessage
-						: "Operation aborted";
-				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(new Text(theme.fg("error", abortMessage), this.outputPad, 0));
-			} else if (message.stopReason === "error") {
-				const errorMsg = message.errorMessage || "Unknown error";
-				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad, 0));
-			}
+			this.contentContainer.addChild(new Text(theme.fg("error", failure), this.outputPad, 0));
 		}
 	}
 }

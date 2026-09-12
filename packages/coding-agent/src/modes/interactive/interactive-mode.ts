@@ -112,7 +112,7 @@ import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { createChatViewport } from "./chat-viewport.ts";
 import { ArminComponent } from "./components/armin.ts";
-import { AssistantMessageComponent } from "./components/assistant-message.ts";
+import { AssistantMessageComponent, formatAssistantMessageFailure } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
@@ -238,6 +238,23 @@ function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionE
 
 function isCompactionCostNotice(item: RenderSessionItem): item is CompactionCostNotice {
 	return "type" in item && item.type === "compaction_cost";
+}
+
+type CompletedFinalAssistantMessage = AssistantMessage & { stopReason: "stop" };
+
+export function isCompletedFinalAssistantMessage(message: AgentMessage): message is CompletedFinalAssistantMessage {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "stop" &&
+		!message.content.some((content) => content.type === "toolCall")
+	);
+}
+
+export function shouldShowInFocusedTranscript(
+	item: RenderSessionItem,
+): item is Extract<AgentMessage, { role: "user" }> | CompletedFinalAssistantMessage {
+	if (isCustomSessionEntry(item) || isCompactionCostNotice(item)) return false;
+	return item.role === "user" || isCompletedFinalAssistantMessage(item);
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -379,6 +396,9 @@ export class InteractiveMode {
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
+	private focusedTranscriptContainer: Container;
+	private focusedFeedbackContainer: Container;
+	private focusedTranscript = false;
 	private documentContainer: Container;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
 	private fullscreenLayoutRoot: Component | undefined;
@@ -450,6 +470,9 @@ export class InteractiveMode {
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
+
+	// Covers extension interception as well as the session's bash execution.
+	private bashCommandRunning = false;
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
@@ -543,10 +566,10 @@ export class InteractiveMode {
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new Container();
+		this.focusedTranscriptContainer = new Container();
+		this.focusedFeedbackContainer = new Container();
 		this.documentContainer = new Container();
-		this.documentContainer.addChild(this.headerContainer);
-		this.documentContainer.addChild(this.loadedResourcesContainer);
-		this.documentContainer.addChild(this.chatContainer);
+		this.updateDocumentTranscript();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
 		this.widgetContainerAbove = new Container();
@@ -777,6 +800,18 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(new DynamicBorder());
+	}
+
+	private updateDocumentTranscript(): void {
+		this.documentContainer.clear();
+		this.documentContainer.addChild(this.headerContainer);
+		if (this.focusedTranscript) {
+			this.documentContainer.addChild(this.focusedTranscriptContainer);
+			this.documentContainer.addChild(this.focusedFeedbackContainer);
+		} else {
+			this.documentContainer.addChild(this.loadedResourcesContainer);
+			this.documentContainer.addChild(this.chatContainer);
+		}
 	}
 
 	private mountInteractiveTui(tui: TuiMainScreen | TuiAltScreen, components: readonly Component[]): void {
@@ -1088,7 +1123,7 @@ export class InteractiveMode {
 			} else if (diagnostic.type === "warning") {
 				this.showWarning(diagnostic.message);
 			} else {
-				this.showStatus(diagnostic.message);
+				this.showTranscriptNotice(diagnostic.message);
 			}
 		}
 
@@ -2000,9 +2035,11 @@ export class InteractiveMode {
 	}
 
 	private renderCurrentSessionState(): void {
+		this.focusedFeedbackContainer.clear();
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		this.pendingBashComponents = [];
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
@@ -2737,7 +2774,7 @@ export class InteractiveMode {
 		} else if (type === "warning") {
 			this.showWarning(message);
 		} else {
-			this.showStatus(message);
+			this.showTranscriptNotice(message);
 		}
 	}
 
@@ -2826,8 +2863,8 @@ export class InteractiveMode {
 	 */
 	private showExtensionError(extensionPath: string, error: string, stack?: string): void {
 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
-		const errorText = new Text(theme.fg("error", errorMsg), 1, 0);
-		this.chatContainer.addChild(errorText);
+		const output = new Container();
+		output.addChild(new Text(theme.fg("error", errorMsg), 1, 0));
 		if (stack) {
 			// Show stack trace in dim color, indented
 			const stackLines = stack
@@ -2836,10 +2873,10 @@ export class InteractiveMode {
 				.map((line) => theme.fg("dim", `  ${line.trim()}`))
 				.join("\n");
 			if (stackLines) {
-				this.chatContainer.addChild(new Text(stackLines, 1, 0));
+				output.addChild(new Text(stackLines, 1, 0));
 			}
 		}
-		this.ui.requestRender();
+		this.addFeedback(output);
 	}
 
 	// =========================================================================
@@ -2890,6 +2927,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.transcript.toggleFinalOnly", () => this.toggleFocusedTranscript());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction(
 			"app.message.copy",
@@ -2965,6 +3003,8 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			this.focusedFeedbackContainer.clear();
+			this.ui.requestRender();
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3022,6 +3062,11 @@ export class InteractiveMode {
 			if (text === "/changelog") {
 				this.handleChangelogCommand();
 				this.editor.setText("");
+				return;
+			}
+			if (text === "/focus") {
+				this.editor.setText("");
+				this.toggleFocusedTranscript();
 				return;
 			}
 			if (text === "/hotkeys") {
@@ -3107,7 +3152,7 @@ export class InteractiveMode {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
-					if (this.session.isBashRunning) {
+					if (this.bashCommandRunning || this.session.isBashRunning) {
 						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
 						this.editor.setText(text);
 						return;
@@ -3181,6 +3226,7 @@ export class InteractiveMode {
 				break;
 
 			case "turn_start":
+				this.focusedFeedbackContainer.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -3222,7 +3268,11 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
+					this.focusedFeedbackContainer.clear();
 					this.addMessageToChat(event.message);
+					if (this.focusedTranscript) {
+						this.addFocusedTranscriptMessage(event.message);
+					}
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
@@ -3314,6 +3364,14 @@ export class InteractiveMode {
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
 				}
+				if (this.focusedTranscript && event.message.role === "assistant") {
+					if (shouldShowInFocusedTranscript(event.message)) {
+						this.addFocusedTranscriptMessage(event.message);
+					} else {
+						const failure = formatAssistantMessageFailure(event.message);
+						if (failure) this.showFocusedFeedback(new Text(theme.fg("error", failure), this.outputPad, 0));
+					}
+				}
 				this.ui.requestRender();
 				break;
 
@@ -3375,6 +3433,8 @@ export class InteractiveMode {
 					this.streamingMessage = undefined;
 				}
 				this.pendingTools.clear();
+				// User text is shown at message_start; message_end extensions may replace it before persistence.
+				this.rebuildFocusedTranscriptIfActive();
 
 				this.ui.requestRender();
 				break;
@@ -3410,7 +3470,7 @@ export class InteractiveMode {
 					if (event.reason === "manual") {
 						this.showError("Compaction cancelled");
 					} else {
-						this.showStatus("Auto-compaction cancelled");
+						this.showTranscriptNotice("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
 					const entries = this.sessionManager.buildContextEntries();
@@ -3434,14 +3494,10 @@ export class InteractiveMode {
 							usage: event.result.usage,
 						});
 					}
+					this.rebuildFocusedTranscriptIfActive();
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
-					if (event.reason === "manual") {
-						this.showError(event.errorMessage);
-					} else {
-						this.chatContainer.addChild(new Spacer(1));
-						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
-					}
+					this.showError(event.errorMessage);
 				}
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
@@ -3528,13 +3584,20 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/** Command/action feedback uses the same status rendering as Ctrl+O and Ctrl+T. */
+	private showStatus(message: string): void {
+		this.showTranscriptNotice(message);
+		// Keep a separate Text: a later background notice may coalesce the ordinary status line.
+		if (this.focusedTranscript) this.showFocusedFeedback(new Text(theme.fg("dim", message), 1, 0));
+	}
+
 	/**
-	 * Show a status message in the chat.
+	 * Show a background notice only in the ordinary transcript.
 	 *
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string): void {
+	private showTranscriptNotice(message: string): void {
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
@@ -3574,6 +3637,40 @@ export class InteractiveMode {
 		}
 
 		this.chatContainer.addChild(component);
+	}
+
+	private addFocusedTranscriptMessage(message: AgentMessage): void {
+		if (!shouldShowInFocusedTranscript(message)) return;
+
+		if (message.role === "user") {
+			const textContent = this.getUserMessageText(message);
+			if (!textContent) return;
+			if (this.focusedTranscriptContainer.children.length > 0) {
+				this.focusedTranscriptContainer.addChild(new Spacer(1));
+			}
+			const skillBlock = parseSkillBlock(textContent);
+			this.focusedTranscriptContainer.addChild(
+				new UserMessageComponent(
+					skillBlock?.userMessage ?? textContent,
+					this.getMarkdownThemeWithSettings(),
+					this.outputPad,
+					this.getMarkdownTransformers(),
+				),
+			);
+			return;
+		}
+
+		if (message.role !== "assistant") return;
+		this.focusedTranscriptContainer.addChild(
+			new AssistantMessageComponent(
+				{ ...message, content: message.content.filter((content) => content.type !== "thinking") },
+				true,
+				this.getMarkdownThemeWithSettings(),
+				this.hiddenThinkingLabel,
+				this.outputPad,
+				this.getMarkdownTransformers(),
+			),
+		);
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
@@ -3683,6 +3780,30 @@ export class InteractiveMode {
 		}
 	}
 
+	private getRenderSessionItems(entries: readonly SessionEntry[]): RenderSessionItem[] {
+		return entries.flatMap((entry): RenderSessionItem[] => {
+			if (entry.type === "custom") {
+				return [entry];
+			}
+			const messages = sessionEntryToContextMessages(entry);
+			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
+				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
+			}
+			return messages;
+		});
+	}
+
+	private rebuildFocusedTranscriptIfActive(): void {
+		if (!this.focusedTranscript) return;
+		this.focusedTranscriptContainer.clear();
+		for (const item of this.getRenderSessionItems(this.sessionManager.buildContextEntries())) {
+			if (shouldShowInFocusedTranscript(item)) {
+				this.addFocusedTranscriptMessage(item);
+			}
+		}
+		this.ui.requestRender();
+	}
+
 	private renderSessionItems(
 		items: readonly RenderSessionItem[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
@@ -3783,17 +3904,7 @@ export class InteractiveMode {
 		entries: SessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
-		const items = entries.flatMap((entry): RenderSessionItem[] => {
-			if (entry.type === "custom") {
-				return [entry];
-			}
-			const messages = sessionEntryToContextMessages(entry);
-			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
-				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
-			}
-			return messages;
-		});
-		this.renderSessionItems(items, options);
+		this.renderSessionItems(this.getRenderSessionItems(entries), options);
 	}
 
 	/**
@@ -3881,8 +3992,9 @@ export class InteractiveMode {
 		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`Session compacted ${times}`);
+			this.showTranscriptNotice(`Session compacted ${times}`);
 		}
+		this.rebuildFocusedTranscriptIfActive();
 	}
 
 	private renderProjectTrustWarningIfNeeded(): void {
@@ -3922,6 +4034,7 @@ export class InteractiveMode {
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.rebuildFocusedTranscriptIfActive();
 	}
 
 	// =========================================================================
@@ -4204,6 +4317,26 @@ export class InteractiveMode {
 		}
 	}
 
+	private toggleFocusedTranscript(): void {
+		if (!this.session.isIdle || this.session.isBashRunning || this.bashCommandRunning) {
+			const message =
+				"Wait for the current response, compaction, or bash command to finish before changing transcript mode.";
+			this.showStatus(message);
+			return;
+		}
+
+		this.focusedFeedbackContainer.clear();
+		this.focusedTranscript = !this.focusedTranscript;
+		if (this.focusedTranscript) {
+			this.rebuildFocusedTranscriptIfActive();
+		} else {
+			this.focusedTranscriptContainer.clear();
+		}
+		this.updateDocumentTranscript();
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
 	private toggleToolOutputExpansion(): void {
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
@@ -4270,16 +4403,30 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showError(errorMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
+	// Operational feedback is separate from the filtered conversation. Keep only the
+	// latest response, until the next submission/turn, session replacement, or mode change.
+	private showFocusedFeedback(component: Component): void {
+		if (!this.focusedTranscript) return;
+		this.focusedFeedbackContainer.clear();
+		this.focusedFeedbackContainer.addChild(new Spacer(1));
+		this.focusedFeedbackContainer.addChild(component);
 		this.ui.requestRender();
 	}
 
-	showWarning(warningMessage: string): void {
+	/** Preserve command output and operational feedback in full mode; also surface it in focus mode. */
+	private addFeedback(component: Component): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(component);
+		this.showFocusedFeedback(component);
 		this.ui.requestRender();
+	}
+
+	showError(errorMessage: string): void {
+		this.addFeedback(new Text(theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
+	}
+
+	showWarning(warningMessage: string): void {
+		this.addFeedback(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
 	}
 
 	showNewVersionNotification(release: LatestPiRelease): void {
@@ -4367,6 +4514,11 @@ export class InteractiveMode {
 
 	private updatePendingMessagesDisplay(): void {
 		this.pendingMessagesContainer.clear();
+		if (!this.focusedTranscript) {
+			for (const component of this.pendingBashComponents) {
+				this.pendingMessagesContainer.addChild(component);
+			}
+		}
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.pendingMessagesContainer.addChild(new Spacer(1));
@@ -4679,6 +4831,7 @@ export class InteractiveMode {
 					onMermaidRenderingModeChange: (mode) => {
 						this.settingsManager.setMermaidRenderingMode(mode);
 						this.chatContainer.invalidate();
+						this.focusedTranscriptContainer.invalidate();
 						this.ui.requestRender();
 					},
 					onShowCacheMissNoticesChange: (shown) => {
@@ -4718,7 +4871,10 @@ export class InteractiveMode {
 						this.settingsManager.setOutputPad(padding);
 						this.outputPad = padding;
 						if (this.streamingComponent || this.session.isStreaming) {
-							for (const child of this.chatContainer.children) {
+							for (const child of [
+								...this.chatContainer.children,
+								...this.focusedTranscriptContainer.children,
+							]) {
 								if (
 									child instanceof AssistantMessageComponent ||
 									child instanceof CustomMessageComponent ||
@@ -6195,8 +6351,7 @@ export class InteractiveMode {
 		if (!name) {
 			const currentName = this.sessionManager.getSessionName();
 			if (currentName) {
-				this.chatContainer.addChild(new Spacer(1));
-				this.chatContainer.addChild(new Text(theme.fg("dim", `Session name: ${currentName}`), 1, 0));
+				this.showStatus(`Session name: ${currentName}`);
 			} else {
 				this.showWarning("Usage: /name <name>");
 			}
@@ -6209,9 +6364,7 @@ export class InteractiveMode {
 		if (sessionName !== name) {
 			this.showWarning(`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`);
 		}
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${sessionName ?? name}`), 1, 0));
-		this.ui.requestRender();
+		this.showStatus(`Session name set: ${sessionName ?? name}`);
 	}
 
 	private handleSessionCommand(): void {
@@ -6272,9 +6425,7 @@ export class InteractiveMode {
 			}
 		}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info, 1, 0));
-		this.ui.requestRender();
+		this.addFeedback(new Text(info, 1, 0));
 	}
 
 	private handleChangelogCommand(): void {
@@ -6289,13 +6440,13 @@ export class InteractiveMode {
 						.join("\n\n")
 				: "No changelog entries found.";
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.ui.requestRender();
+		const output = new Container();
+		output.addChild(new DynamicBorder());
+		output.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+		output.addChild(new Spacer(1));
+		output.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
+		output.addChild(new DynamicBorder());
+		this.addFeedback(output);
 	}
 
 	/**
@@ -6349,6 +6500,7 @@ export class InteractiveMode {
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
+		const toggleFinalOnlyTranscript = this.getAppKeyDisplay("app.transcript.toggleFinalOnly") || "Unbound";
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const cycleModelBackward = this.getAppKeyDisplay("app.model.cycleBackward");
 		const copyMessage = this.getAppKeyDisplay("app.message.copy");
@@ -6394,6 +6546,7 @@ export class InteractiveMode {
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
+| \`${toggleFinalOnlyTranscript}\` | Toggle final-only transcript (idle only) |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${copyMessage}\` | Copy last assistant message |
 | \`${followUp}\` | Queue follow-up message |
@@ -6420,13 +6573,13 @@ export class InteractiveMode {
 			}
 		}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.ui.requestRender();
+		const output = new Container();
+		output.addChild(new DynamicBorder());
+		output.addChild(new Text(theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
+		output.addChild(new Spacer(1));
+		output.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
+		output.addChild(new DynamicBorder());
+		this.addFeedback(output);
 	}
 
 	private async handleClearCommand(): Promise<void> {
@@ -6436,9 +6589,7 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return;
 			}
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
-			this.ui.requestRender();
+			this.addFeedback(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
 		} catch (error: unknown) {
 			await this.handleFatalRuntimeError("Failed to create session", error);
 		}
@@ -6470,11 +6621,9 @@ export class InteractiveMode {
 		fs.mkdirSync(path.dirname(debugLogPath), { recursive: true });
 		fs.writeFileSync(debugLogPath, debugData);
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(
+		this.addFeedback(
 			new Text(`${theme.fg("accent", "✓ Debug log written")}\n${theme.fg("muted", debugLogPath)}`, 1, 1),
 		);
-		this.ui.requestRender();
 	}
 
 	private handleArminSaysHi(): void {
@@ -6502,32 +6651,41 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
+		this.bashCommandRunning = true;
+		try {
+			// Include asynchronous extension interception in the idle-only toggle guard.
+			const eventResult = await this.session.extensionRunner.emitUserBash({
+				type: "user_bash",
+				command,
+				excludeFromContext,
+				cwd: this.sessionManager.getCwd(),
+			});
 
-		// Emit user_bash event to let extensions intercept
-		const eventResult = await extensionRunner.emitUserBash({
-			type: "user_bash",
-			command,
-			excludeFromContext,
-			cwd: this.sessionManager.getCwd(),
-		});
-
-		// If extension returned a full result, use it directly
-		if (eventResult?.result) {
-			const result = eventResult.result;
-
-			// Create UI component for display
 			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
 			if (this.session.isStreaming) {
-				this.pendingMessagesContainer.addChild(this.bashComponent);
 				this.pendingBashComponents.push(this.bashComponent);
+				this.updatePendingMessagesDisplay();
 			} else {
 				this.chatContainer.addChild(this.bashComponent);
 			}
+			this.ui.requestRender();
 
-			// Show output and complete
-			if (result.output) {
-				this.bashComponent.appendOutput(result.output);
+			const result =
+				eventResult?.result ??
+				(await this.session.executeBash(
+					command,
+					(chunk) => {
+						if (this.bashComponent) {
+							this.bashComponent.appendOutput(chunk);
+							this.ui.requestRender();
+						}
+					},
+					{ excludeFromContext, operations: eventResult?.operations },
+				));
+
+			if (eventResult?.result) {
+				if (result.output) this.bashComponent.appendOutput(result.output);
+				this.session.recordBashResult(command, result, { excludeFromContext });
 			}
 			this.bashComponent.setComplete(
 				result.exitCode,
@@ -6535,57 +6693,24 @@ export class InteractiveMode {
 				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 				result.fullOutputPath,
 			);
-
-			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
-			this.bashComponent = undefined;
-			this.ui.requestRender();
-			return;
-		}
-
-		// Normal execution path (possibly with custom operations)
-		const isDeferred = this.session.isStreaming;
-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
-
-		if (isDeferred) {
-			// Show in pending area when agent is streaming
-			this.pendingMessagesContainer.addChild(this.bashComponent);
-			this.pendingBashComponents.push(this.bashComponent);
-		} else {
-			// Show in chat immediately when agent is idle
-			this.chatContainer.addChild(this.bashComponent);
-		}
-		this.ui.requestRender();
-
-		try {
-			const result = await this.session.executeBash(
-				command,
-				(chunk) => {
-					if (this.bashComponent) {
-						this.bashComponent.appendOutput(chunk);
-						this.ui.requestRender();
-					}
-				},
-				{ excludeFromContext, operations: eventResult?.operations },
-			);
-
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(
-					result.exitCode,
-					result.cancelled,
-					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
-					result.fullOutputPath,
+			if (result.cancelled || (result.exitCode !== undefined && result.exitCode !== 0)) {
+				const status = result.cancelled ? "cancelled" : `failed (exit ${result.exitCode})`;
+				this.showFocusedFeedback(
+					new Text(
+						theme.fg("error", `Bash command ${status}. Switch to the full transcript to inspect its output.`),
+						1,
+						0,
+					),
 				);
 			}
 		} catch (error) {
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(undefined, false);
-			}
+			this.bashComponent?.setComplete(undefined, false);
 			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+		} finally {
+			this.bashComponent = undefined;
+			this.bashCommandRunning = false;
+			this.ui.requestRender();
 		}
-
-		this.bashComponent = undefined;
-		this.ui.requestRender();
 	}
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {

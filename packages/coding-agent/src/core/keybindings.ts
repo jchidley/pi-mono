@@ -23,6 +23,7 @@ export interface AppKeybindings {
 	"app.model.select": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.transcript.toggleFinalOnly": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
 	"app.message.copy": true;
@@ -118,6 +119,10 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+	},
+	"app.transcript.toggleFinalOnly": {
+		defaultKeys: [],
+		description: "Toggle final-only transcript",
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",

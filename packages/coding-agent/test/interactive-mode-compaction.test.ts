@@ -87,7 +87,7 @@ describe("InteractiveMode compaction events", () => {
 				usage: previousUsage,
 			},
 		];
-		const fakeThis = { renderSessionItems: vi.fn() };
+		const fakeThis = Object.setPrototypeOf({ renderSessionItems: vi.fn() }, InteractiveMode.prototype);
 		const renderSessionEntries = Reflect.get(InteractiveMode.prototype, "renderSessionEntries") as (
 			this: typeof fakeThis,
 			entries: SessionEntry[],
@@ -145,6 +145,7 @@ describe("InteractiveMode compaction events", () => {
 			chatContainer: { clear: vi.fn() },
 			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
 			renderSessionEntries: vi.fn(),
+			rebuildFocusedTranscriptIfActive: vi.fn(),
 			addMessageToChat: vi.fn(),
 			addCompactionCostNotice: vi.fn(),
 			showError: vi.fn(),
@@ -202,6 +203,7 @@ describe("InteractiveMode compaction events", () => {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
 			activeStatusIndicator: undefined,
+			focusedFeedbackContainer: { clear: vi.fn() },
 			workingVisible: true,
 			showWorkingStatusIndicator: vi.fn(),
 			clearStatusIndicator: vi.fn(),
