@@ -6,7 +6,7 @@
 
 - Added `ctx.modelRegistry.stream()` and `streamSimple()` for extension model calls through configured providers with resolved authentication ([#8964](https://github.com/earendil-works/pi/issues/8964)).
 - Added per-model `reserveTokens` and `keepRecentTokens` settings through `compaction.modelOverrides`, with ordinary compaction settings as fallback ([#8133](https://github.com/earendil-works/pi-mono/issues/8133)).
-- Added `/focus` and the optional unbound `app.transcript.toggleFinalOnly` action for an idle-only, temporary transcript view containing user messages and final assistant responses.
+- Added `/focus` and the optional unbound `app.transcript.toggleFinalOnly` action for a temporary transcript view containing user messages and final assistant responses; it can be toggled while responses, tools, compaction, or bash commands are active.
 
 ### Changed
 

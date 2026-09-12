@@ -197,7 +197,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/share` | Upload as private GitHub gist with shareable HTML link |
 | `/reload` | Reload keybindings, extensions, skills, prompts, themes, and context files |
 | `/hotkeys` | Show all keyboard shortcuts |
-| `/focus` | Toggle the temporary user/final-assistant-only transcript while idle |
+| `/focus` | Immediately toggle the temporary user/final-assistant-only transcript, including while pi is working |
 | `/changelog` | Display version history |
 | `/quit` | Quit pi |
 
