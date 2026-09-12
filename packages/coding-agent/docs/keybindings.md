@@ -161,9 +161,18 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
+| `app.transcript.toggleFinalOnly` | *(none)* | Toggle the final-only transcript while idle (same as `/focus`) |
 | `app.message.copy` | `ctrl+x` | Copy the selected message in `/tree`; in fullscreen mode, copy the active selection when `fullscreenCopyOnSelect` is `false`; otherwise copy the last assistant message |
 | `app.message.followUp` | `alt+enter` (`ctrl+q` on Windows and WSL) | Queue follow-up message |
 | `app.message.dequeue` | `alt+up` (`alt+q` on Windows and WSL) | Restore queued messages to editor |
+
+### Focused Transcript
+
+Use `/focus` to toggle the final-only transcript while idle; no keybinding setup is required. The optional `app.transcript.toggleFinalOnly` action invokes the same toggle and has no default binding. For example, add `"app.transcript.toggleFinalOnly": "f6"` to your configuration, then run `/reload`. Avoid `ctrl+y` unless you intend to replace the editor's yank shortcut.
+
+The final-only transcript is temporary, remains active across turns and session switches, and is not saved. It shows user text and assistant responses completed with `stopReason: "stop"`, without tool calls or thinking. Streaming output, truncated/failed/aborted responses, bash executions (including pending commands), custom entries and messages, summaries, and ordinary transcript notices are excluded. Like the ordinary display, it uses the current compaction-aware session context, not the entire pre-compaction history.
+
+Live errors and warnings, blocked-toggle feedback, and explicitly requested output such as `/hotkeys`, `/session`, `/name`, and `/changelog` appear separately below the conversation. Only the latest feedback is retained there; the next submission or turn, session replacement, or successful mode change clears it. The ordinary transcript still retains these messages. Toggling the filter off restores that transcript, including pending bash output. Pi refuses to change the mode while a response, compaction, branch summary, retry, bash command, or asynchronous `user_bash` hook is active.
 
 ### Tree Navigation
 
