@@ -288,6 +288,7 @@ describe("focused transcript filtering", () => {
 						getShowImages: () => false,
 						getImageWidthCells: () => 60,
 						getShowTerminalProgress: () => false,
+						getShowCacheMissNotices: () => false,
 					},
 					sessionManager: { getCwd: () => process.cwd(), buildContextEntries: () => persistedEntries },
 				},
@@ -657,6 +658,8 @@ describe("focused transcript filtering", () => {
 			runtimeHost: {
 				session: {
 					extensionRunner: { getShortcuts: () => new Map() },
+					settingsManager: { getCacheWarmingMode: () => "off" },
+					cacheWarmingStatus: undefined,
 					getSessionStats: () => stats,
 					modelRuntime: {},
 					sessionManager: {
