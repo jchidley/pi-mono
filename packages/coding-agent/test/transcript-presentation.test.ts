@@ -48,7 +48,7 @@ describe("transcript presentation", () => {
 		const presentation = new TranscriptPresentation({
 			header: new Text("header", 0, 0),
 			resources: new Text("resources", 0, 0),
-			transcript: new Text("ordinary", 0, 0),
+			transcript: pendingOutput("ordinary"),
 			pendingOutput: pendingOutput("pending"),
 			getMarkdownTheme,
 			getOutputPad: () => 1,
@@ -124,7 +124,7 @@ describe("transcript presentation", () => {
 		const presentation = new TranscriptPresentation({
 			header: new Text("header", 0, 0),
 			resources: new Text("resources", 0, 0),
-			transcript: new Text("ordinary", 0, 0),
+			transcript: pendingOutput("ordinary"),
 			pendingOutput: pendingOutput("pending"),
 			getMarkdownTheme,
 			getOutputPad: () => 1,
@@ -155,10 +155,12 @@ describe("transcript presentation", () => {
 		let padding = 1;
 		let label = "old rendering";
 		const ordinary = new Text("ordinary initial", 0, 0);
+		const transcript = new Container();
+		transcript.addChild(ordinary);
 		const presentation = new TranscriptPresentation({
 			header: new Text("header", 0, 0),
 			resources: new Text("resources", 0, 0),
-			transcript: ordinary,
+			transcript,
 			pendingOutput: pendingOutput("pending"),
 			getMarkdownTheme,
 			getOutputPad: () => padding,
@@ -193,7 +195,7 @@ describe("transcript presentation", () => {
 		const presentation = new TranscriptPresentation({
 			header: new Text("header", 0, 0),
 			resources: new Text("resources", 0, 0),
-			transcript: new Text("ordinary", 0, 0),
+			transcript: pendingOutput("ordinary"),
 			pendingOutput: pendingOutput("pending"),
 			getMarkdownTheme,
 			getOutputPad: () => 1,

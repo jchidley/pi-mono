@@ -4,6 +4,7 @@ import { Container, Text, type TUI } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
 import type { SessionEntry } from "../../../src/core/session-manager.ts";
+import type { BashExecutionComponent } from "../../../src/modes/interactive/components/bash-execution.ts";
 import type { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
@@ -35,6 +36,8 @@ type RenderSessionItems = (
 
 type RenderSessionContextThis = {
 	pendingTools: Map<string, ToolExecutionComponent>;
+	pendingBashComponents: Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">;
+	pendingMessagesContainer: Container;
 	chatContainer: Container;
 	footer: { invalidate(): void };
 	programStatus: { handleEvent(): void };
@@ -67,6 +70,8 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const chatContainer = new Container();
 	return {
 		pendingTools: new Map<string, ToolExecutionComponent>(),
+		pendingBashComponents: new Map(),
+		pendingMessagesContainer: new Container(),
 		chatContainer,
 		footer: { invalidate: vi.fn() },
 		programStatus: { handleEvent: vi.fn() },

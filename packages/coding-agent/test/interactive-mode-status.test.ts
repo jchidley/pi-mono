@@ -10,7 +10,8 @@ import type { QuietStartup } from "../src/core/settings-manager.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -79,8 +80,18 @@ describe("InteractiveMode.showStatus", () => {
 	});
 
 	test("coalesces immediately-sequential status messages", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			transcriptPresentation: new TranscriptPresentation({
+				header: new Container(),
+				resources: new Container(),
+				transcript: chatContainer,
+				pendingOutput: new Container(),
+				getMarkdownTheme,
+				getOutputPad: () => 1,
+				getMarkdownTransformers: () => [],
+			}),
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
@@ -98,8 +109,18 @@ describe("InteractiveMode.showStatus", () => {
 	});
 
 	test("appends a new status line if something else was added in between", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			transcriptPresentation: new TranscriptPresentation({
+				header: new Container(),
+				resources: new Container(),
+				transcript: chatContainer,
+				pendingOutput: new Container(),
+				getMarkdownTheme,
+				getOutputPad: () => 1,
+				getMarkdownTransformers: () => [],
+			}),
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
@@ -164,7 +185,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(header.setExpanded).toHaveBeenCalledWith(true);
 		expect(loadedResourcesChild.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded", "background");
 	});
 });
 

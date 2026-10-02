@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -16,6 +19,14 @@ function submit(terminal: VirtualTerminal, text: string) {
 async function screen(terminal: VirtualTerminal) {
 	await terminal.waitForRender();
 	return terminal.getViewport().join("\n");
+}
+
+function deferred() {
+	let resolve = () => {};
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
 }
 
 async function setup(options: HarnessOptions = {}) {
@@ -63,6 +74,381 @@ async function setup(options: HarnessOptions = {}) {
 }
 
 describe("focus lifecycle", () => {
+	it.each([false, true])(
+		"rejects new manual commands during replacement construction, preserves their draft, then permits retry (intercepted=%s)",
+		async (intercepted) => {
+			const replacementStarted = deferred();
+			const replacementRelease = deferred();
+			let factories = 0;
+			let interceptions = 0;
+			const test = await setup({
+				settings: { quietStartup: true },
+				extensionFactories: [
+					async (pi) => {
+						if (++factories === 2) {
+							replacementStarted.resolve();
+							await replacementRelease.promise;
+						}
+						if (intercepted)
+							pi.on("user_bash", () => {
+								interceptions++;
+								return {
+									result: { output: "construction output", exitCode: 0, cancelled: false, truncated: false },
+								};
+							});
+					},
+				],
+			});
+			const marker = join(test.initial.tempDir, "construction-marker");
+			const command = intercepted
+				? "held-window-command"
+				: `printf 'construction output\\n'; printf marker > '${marker}'`;
+			const draftPrefix = intercepted ? "!held-window-command" : "!printf 'construction output";
+			try {
+				await test.mode.init();
+				submit(test.terminal, "/focus");
+				submit(test.terminal, "/new");
+				await replacementStarted.promise;
+				submit(test.terminal, `!${command}`);
+				await vi.waitFor(async () =>
+					expect(await screen(test.terminal)).toContain("Session replacement is still in progress"),
+				);
+				const output = await screen(test.terminal);
+				expect(output).toContain("Retry this command after it finishes");
+				expect(output).toContain(draftPrefix);
+				expect(interceptions).toBe(0);
+				expect(existsSync(marker)).toBe(false);
+				expect(test.initial.session.messages).toEqual([]);
+				replacementRelease.resolve();
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
+				expect(await screen(test.terminal)).toContain(draftPrefix);
+				expect(test.current().session.messages).toEqual([]);
+				test.terminal.sendInput("\r"); // Retry the preserved draft only after the new session is ready.
+				await vi.waitFor(() =>
+					expect(test.current().session.messages).toEqual([
+						expect.objectContaining({
+							role: "bashExecution",
+							command,
+							output: intercepted ? "construction output" : "construction output\n",
+						}),
+					]),
+				);
+				expect(
+					(await screen(test.terminal)).split("\n").filter((line) => line.trim() === "construction output"),
+				).toHaveLength(1);
+				expect(interceptions).toBe(intercepted ? 1 : 0);
+				expect(existsSync(marker)).toBe(!intercepted);
+				expect(test.initial.session.messages).toEqual([]);
+				expect(test.current().faux.state.callCount).toBe(0);
+			} finally {
+				replacementRelease.resolve();
+				await screen(test.terminal);
+				test.cleanup();
+			}
+		},
+	);
+
+	it("discards an old interception error during replacement construction, before the new session is applied", async () => {
+		const interceptionStarted = deferred();
+		const interceptionRelease = deferred();
+		const replacementStarted = deferred();
+		const replacementRelease = deferred();
+		let factoryRuns = 0;
+		const test = await setup({
+			settings: { quietStartup: true },
+			extensionFactories: [
+				async (pi) => {
+					if (++factoryRuns === 2) {
+						replacementStarted.resolve();
+						await replacementRelease.promise;
+					}
+					pi.on("user_bash", async () => {
+						interceptionStarted.resolve();
+						await interceptionRelease.promise;
+						throw new Error("invalidated interception error");
+					});
+				},
+			],
+		});
+		try {
+			await test.mode.init();
+			submit(test.terminal, "!invalidated command");
+			await interceptionStarted.promise;
+			submit(test.terminal, "/new");
+			await replacementStarted.promise;
+			interceptionRelease.resolve();
+			expect(await screen(test.terminal)).not.toContain("invalidated interception error");
+			replacementRelease.resolve();
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
+			expect(await screen(test.terminal)).not.toContain("invalidated interception error");
+			expect(test.current().session.messages).toEqual([]);
+		} finally {
+			interceptionRelease.resolve();
+			replacementRelease.resolve();
+			await screen(test.terminal);
+			test.cleanup();
+		}
+	});
+
+	it("ignores late old execution callbacks while a new session's manual command is streaming", async () => {
+		const oldStarted = deferred();
+		const oldRelease = deferred();
+		const nextStarted = deferred();
+		const nextRelease = deferred();
+		const executions: string[] = [];
+		const test = await setup({
+			settings: { quietStartup: true },
+			extensionFactories: [
+				(pi) => {
+					pi.on("user_bash", () => ({
+						operations: {
+							exec: async (command, _cwd, { onData }) => {
+								executions.push(command);
+								if (command === "old execution") {
+									onData(Buffer.from("old initial chunk\n"));
+									oldStarted.resolve();
+									await oldRelease.promise; // Deliberately model a remote callback arriving after cancellation.
+									onData(Buffer.from("late old execution chunk\n"));
+									return { exitCode: 17 };
+								}
+								onData(Buffer.from("new initial chunk\n"));
+								nextStarted.resolve();
+								await nextRelease.promise;
+								onData(Buffer.from("new final chunk\n"));
+								return { exitCode: 0 };
+							},
+						},
+					}));
+				},
+			],
+		});
+		try {
+			await test.mode.init();
+			submit(test.terminal, "/focus");
+			submit(test.terminal, "!old execution");
+			await oldStarted.promise;
+			submit(test.terminal, "/new");
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
+			submit(test.terminal, "!new execution");
+			await nextStarted.promise;
+			oldRelease.resolve();
+			let output = await screen(test.terminal);
+			expect(output).toContain("new initial chunk");
+			expect(output).not.toContain("late old execution chunk");
+			nextRelease.resolve();
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new final chunk"));
+			for (let view = 0; view < 2; view++) {
+				output = await screen(test.terminal);
+				expect(output).toContain("new initial chunk");
+				expect(output).toContain("new final chunk");
+				expect(output).not.toContain("old initial chunk");
+				expect(output).not.toContain("late old execution chunk");
+				expect(output).not.toContain("exit code 17");
+				submit(test.terminal, "/focus");
+			}
+			expect(executions).toEqual(["old execution", "new execution"]);
+			expect(test.current().session.messages).toEqual([
+				expect.objectContaining({
+					role: "bashExecution",
+					command: "new execution",
+					output: "new initial chunk\nnew final chunk\n",
+					exitCode: 0,
+				}),
+			]);
+		} finally {
+			oldRelease.resolve();
+			nextRelease.resolve();
+			await screen(test.terminal);
+			test.cleanup();
+		}
+	});
+
+	it.each(["result", "operations", "rejection"] as const)(
+		"discards stale manual interception %s after native session replacement",
+		async (path) => {
+			const started = deferred();
+			const release = deferred();
+			let oldExecutions = 0;
+			const test = await setup({
+				settings: { quietStartup: true },
+				extensionFactories: [
+					(pi) => {
+						pi.on("user_bash", async ({ command }) => {
+							if (command === "old held command") {
+								started.resolve();
+								await release.promise;
+								if (path === "rejection") throw new Error("stale interception rejection");
+								if (path === "operations")
+									return {
+										operations: {
+											exec: async (_command, _cwd, { onData }) => {
+												oldExecutions++;
+												onData(Buffer.from("stale manual output\n"));
+												return { exitCode: 0 };
+											},
+										},
+									};
+								return {
+									result: { output: "stale manual output", exitCode: 0, cancelled: false, truncated: false },
+								};
+							}
+							return {
+								result: {
+									output: "new session manual output",
+									exitCode: 0,
+									cancelled: false,
+									truncated: false,
+								},
+							};
+						});
+					},
+				],
+			});
+			try {
+				await test.mode.init();
+				submit(test.terminal, "/focus");
+				submit(test.terminal, "!old held command");
+				await started.promise;
+				submit(test.terminal, "/new");
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
+				release.resolve();
+				let output = await screen(test.terminal);
+				expect(output).not.toContain("stale manual output");
+				expect(output).not.toContain("stale interception rejection");
+				submit(test.terminal, "/focus");
+				output = await screen(test.terminal);
+				expect(output).not.toContain("old held command");
+				expect(output).not.toContain("stale interception rejection");
+				expect(oldExecutions).toBe(0);
+				expect(test.initial.session.messages).toEqual([]);
+				expect(test.current().session.messages).toEqual([]);
+				submit(test.terminal, "!!new command");
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new session manual output"));
+				expect(test.current().session.messages).toEqual([
+					expect.objectContaining({ role: "bashExecution", command: "new command", excludeFromContext: true }),
+				]);
+				expect(test.current().faux.state.callCount).toBe(0);
+			} finally {
+				release.resolve();
+				await screen(test.terminal);
+				test.cleanup();
+			}
+		},
+	);
+
+	it("releases the old reservation on replacement without letting its finally clear a newer interception", async () => {
+		const oldStarted = deferred();
+		const oldRelease = deferred();
+		const nextStarted = deferred();
+		const nextRelease = deferred();
+		const interceptions: string[] = [];
+		const test = await setup({
+			settings: { quietStartup: true },
+			extensionFactories: [
+				(pi) => {
+					pi.on("user_bash", async ({ command }) => {
+						interceptions.push(command);
+						if (command === "old reservation") {
+							oldStarted.resolve();
+							await oldRelease.promise;
+						}
+						if (command === "new reservation") {
+							nextStarted.resolve();
+							await nextRelease.promise;
+						}
+						return { result: { output: `${command} output`, exitCode: 0, cancelled: false, truncated: false } };
+					});
+				},
+			],
+		});
+		try {
+			await test.mode.init();
+			submit(test.terminal, "/focus");
+			submit(test.terminal, "!old reservation");
+			await oldStarted.promise;
+			submit(test.terminal, "/new");
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
+			submit(test.terminal, "!new reservation");
+			await vi.waitFor(() => expect(interceptions).toEqual(["old reservation", "new reservation"]));
+			await nextStarted.promise;
+			oldRelease.resolve();
+			expect(await screen(test.terminal)).not.toContain("old reservation output");
+			submit(test.terminal, "!overlapping reservation");
+			expect(await screen(test.terminal)).toContain("A bash command is already running");
+			expect(interceptions).toEqual(["old reservation", "new reservation"]);
+			nextRelease.resolve();
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new reservation output"));
+			expect(test.current().session.messages).toEqual([expect.objectContaining({ command: "new reservation" })]);
+			test.terminal.sendInput("\x15"); // Clear the natively preserved rejected-command draft.
+			submit(test.terminal, "!after reservation");
+			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("after reservation output"));
+			expect(interceptions).toEqual(["old reservation", "new reservation", "after reservation"]);
+		} finally {
+			oldRelease.resolve();
+			nextRelease.resolve();
+			await screen(test.terminal);
+			test.cleanup();
+		}
+	});
+
+	it.each(["native", "extension"] as const)(
+		"routes resume completion by its %s invocation origin while retaining focus",
+		async (origin) => {
+			const directory = mkdtempSync(join(tmpdir(), "pi-focus-resume-origin-"));
+			const initialManager = SessionManager.create(directory, directory);
+			initialManager.appendMessage({ role: "user", content: "initial resume user", timestamp: 1 });
+			const selected = SessionManager.create(directory, directory);
+			selected.appendMessage({ role: "user", content: "selected resume user", timestamp: 2 });
+			selected.appendMessage(fauxAssistantMessage("selected resume answer"));
+			selected.appendSessionInfo("selected resume session");
+			const selectedPath = selected.getSessionFile()!;
+			const test = await setup({
+				sessionManager: initialManager,
+				settings: { quietStartup: true },
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("extension-resume", {
+							description: "Offline extension resume",
+							handler: async (_args, ctx) => {
+								await ctx.switchSession(selectedPath);
+							},
+						});
+					},
+				],
+			});
+			try {
+				await test.mode.init();
+				submit(test.terminal, "/focus");
+				if (origin === "native") {
+					submit(test.terminal, "/resume");
+					await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("selected resume session"));
+					test.terminal.sendInput("selected resume session");
+					test.terminal.sendInput("\r");
+					await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Resumed session"));
+				} else {
+					await test.initial.session.prompt("/extension-resume");
+				}
+				expect(test.runtime.session.sessionFile).toBe(selectedPath);
+				let output = await screen(test.terminal);
+				expect(output).toContain("selected resume user");
+				expect(output).toContain("selected resume answer");
+				expect(output).not.toContain("initial resume user");
+				if (origin === "native") expect(output).toContain("Resumed session");
+				else expect(output).not.toContain("Resumed session");
+				test.mode.showWarning("resume background diagnostic");
+				expect(await screen(test.terminal)).not.toContain("resume background diagnostic");
+				submit(test.terminal, "/focus");
+				output = await screen(test.terminal);
+				expect(output).toContain("Resumed session");
+				expect(output).toContain("resume background diagnostic");
+				expect(test.initial.faux.state.callCount).toBe(0);
+				expect(test.current().faux.state.callCount).toBe(0);
+			} finally {
+				test.cleanup();
+				rmSync(directory, { recursive: true });
+			}
+		},
+	);
 	it("shows transformed user and assistant completions once before persistence and after reconciliation", async () => {
 		const test = await setup({
 			extensionFactories: [
