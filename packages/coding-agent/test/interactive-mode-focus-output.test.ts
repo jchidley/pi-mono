@@ -851,8 +851,10 @@ describe("explicit native output in focus", () => {
 				submit(test.terminal, "/focus");
 				submit(test.terminal, command);
 				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain(expected));
+				expect(await screen(test.terminal)).toContain(command === "/name" ? "Focus W:1 E:0" : "Focus W:0 E:1");
 				test.mode.showError("background error after command");
 				expect(await screen(test.terminal)).not.toContain("background error after command");
+				expect(await screen(test.terminal)).toContain(command === "/name" ? "Focus W:1 E:1" : "Focus W:0 E:2");
 				submit(test.terminal, "/focus");
 				const output = await screen(test.terminal);
 				expect(output).toContain(expected);
