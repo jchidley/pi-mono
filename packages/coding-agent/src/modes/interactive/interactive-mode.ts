@@ -200,6 +200,7 @@ import {
 	theme,
 } from "./theme/theme.ts";
 import { InteractiveThemeController } from "./theme/theme-controller.ts";
+import { TranscriptPresentation } from "./transcript-presentation.ts";
 import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
 
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
@@ -454,7 +455,7 @@ export class InteractiveMode {
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
-	private documentContainer: Container;
+	private transcriptPresentation: TranscriptPresentation;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
 	private fullscreenLayoutRoot: Component | undefined;
 	private pendingMessagesContainer: Container;
@@ -626,11 +627,13 @@ export class InteractiveMode {
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new Container();
-		this.documentContainer = new Container();
-		this.documentContainer.addChild(this.headerContainer);
-		this.documentContainer.addChild(this.loadedResourcesContainer);
-		this.documentContainer.addChild(this.chatContainer);
 		this.pendingMessagesContainer = new Container();
+		this.transcriptPresentation = new TranscriptPresentation({
+			header: this.headerContainer,
+			resources: this.loadedResourcesContainer,
+			transcript: this.chatContainer,
+			pendingOutput: this.pendingMessagesContainer,
+		});
 		this.statusContainer = new Container();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
@@ -959,8 +962,8 @@ export class InteractiveMode {
 		// Keep one component tree and remount it when changing renderers.
 		this.renderWidgets(); // Initialize with default spacer
 		const viewport = createChatViewport({
-			document: this.documentContainer,
-			pendingMessages: this.pendingMessagesContainer,
+			document: this.transcriptPresentation.document,
+			pendingMessages: this.transcriptPresentation.pendingOutput,
 			status: this.statusContainer,
 			widgetsAbove: this.widgetContainerAbove,
 			editor: this.editorContainer,
@@ -973,8 +976,8 @@ export class InteractiveMode {
 		this.transcriptScrollView = viewport.transcript;
 		this.fullscreenLayoutRoot = viewport.root;
 		this.mountInteractiveTui(this.renderer, [
-			this.documentContainer,
-			this.pendingMessagesContainer,
+			this.transcriptPresentation.document,
+			this.transcriptPresentation.pendingOutput,
 			this.statusContainer,
 			this.widgetContainerAbove,
 			this.editorContainer,
