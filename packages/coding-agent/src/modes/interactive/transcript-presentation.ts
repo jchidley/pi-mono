@@ -6,10 +6,12 @@ import type { MarkdownTransformer } from "../../core/extensions/types.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 
+export type TranscriptOutputIntent = "explicit" | "background";
+
 export interface TranscriptPresentationOptions {
 	readonly header: Component;
 	readonly resources: Component;
-	readonly transcript: Component;
+	readonly transcript: Container;
 	readonly pendingOutput: Container;
 	readonly getMarkdownTheme: () => MarkdownTheme;
 	readonly getOutputPad: () => number;
@@ -32,6 +34,8 @@ export class TranscriptPresentation {
 	private readonly conversation = new Container();
 	private readonly options: TranscriptPresentationOptions;
 	private messages: AgentMessage[] = [];
+	private readonly messageComponents = new Map<Component, AgentMessage>();
+	private readonly explicitOutput = new Set<Component>();
 	private focusEnabled = false;
 
 	constructor(options: TranscriptPresentationOptions) {
@@ -58,16 +62,63 @@ export class TranscriptPresentation {
 		this.refreshConversation();
 	}
 
+	/** Bind conversation projections to native components so explicit output keeps native ordering. */
+	messagePresented(message: AgentMessage, component: Component): void {
+		this.messageComponents.set(component, message);
+		this.refreshConversation();
+	}
+
+	/** Share the native component, including its live updates; never reconstruct command output. */
+	addExplicitOutput(component: Component): void {
+		this.addOutput(component, "explicit");
+	}
+
+	addOutput(component: Component, intent: TranscriptOutputIntent = "background"): void {
+		this.options.transcript.addChild(component);
+		if (intent === "explicit") {
+			this.explicitOutput.add(component);
+			this.refreshConversation();
+		}
+	}
+
+	/** Retain a mounted live exception at its native position while the host refreshes history. */
+	rebuildPreservingExplicitOutput(component: Component | undefined, rebuild: () => void): void {
+		const children = this.options.transcript.children;
+		const index = component ? children.indexOf(component) : -1;
+		const followingMessages =
+			index < 0
+				? undefined
+				: new Set(
+						children.slice(index + 1).flatMap((child) => {
+							const message = this.messageComponents.get(child);
+							return message ? [message] : [];
+						}),
+					);
+		rebuild();
+		// Pending dock components are not mounted in the transcript and stay in their native surface.
+		if (!component || !followingMessages) return;
+		const restoredChildren = this.options.transcript.children;
+		const before = restoredChildren.findIndex((child) => {
+			const message = this.messageComponents.get(child);
+			return message !== undefined && followingMessages.has(message);
+		});
+		restoredChildren.splice(before < 0 ? restoredChildren.length : before, 0, component);
+		this.explicitOutput.add(component);
+		this.refreshConversation();
+	}
+
 	/** Session-local presentation state is discarded, but the process-local viewing preference survives. */
 	resetSession(): void {
 		this.options.pendingOutput.clear();
+		this.messageComponents.clear();
+		this.explicitOutput.clear();
 		this.replaceHistory([]);
 	}
 
 	messageStarted(message: AgentMessage): void {
 		if (message.role !== "user") return;
 		this.messages.push(message);
-		this.renderConversationMessage(message);
+		this.refreshConversation();
 	}
 
 	/** Consume the completed event directly: listeners run before session persistence. */
@@ -113,7 +164,26 @@ export class TranscriptPresentation {
 	/** Refresh rendering inputs without rebuilding the ordinary live component graph. */
 	refreshConversation(): void {
 		this.conversation.clear();
-		for (const message of this.messages) this.renderConversationMessage(message);
+		const nativeChildren = new Set(this.options.transcript.children);
+		for (const component of this.messageComponents.keys()) {
+			if (!nativeChildren.has(component)) this.messageComponents.delete(component);
+		}
+		for (const component of this.explicitOutput) {
+			if (!nativeChildren.has(component)) this.explicitOutput.delete(component);
+		}
+		const presented = new Set<AgentMessage>();
+		for (const component of this.options.transcript.children) {
+			if (this.explicitOutput.has(component)) this.conversation.addChild(component);
+			const message = this.messageComponents.get(component);
+			if (message && this.messages.includes(message) && !presented.has(message)) {
+				this.renderConversationMessage(message);
+				presented.add(message);
+			}
+		}
+		// History and live boundaries can arrive before the host mounts their native components.
+		for (const message of this.messages) {
+			if (!presented.has(message)) this.renderConversationMessage(message);
+		}
 	}
 
 	private renderMessage(message: ConversationMessage): void {

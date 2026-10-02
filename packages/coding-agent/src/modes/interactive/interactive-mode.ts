@@ -200,7 +200,7 @@ import {
 	theme,
 } from "./theme/theme.ts";
 import { InteractiveThemeController } from "./theme/theme-controller.ts";
-import { TranscriptPresentation } from "./transcript-presentation.ts";
+import { type TranscriptOutputIntent, TranscriptPresentation } from "./transcript-presentation.ts";
 import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
 
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
@@ -273,6 +273,7 @@ type CompactionCostNotice = {
 	type: "compaction_cost";
 	kind: "compaction" | "branch_summary";
 	usage: Usage;
+	intent?: TranscriptOutputIntent;
 };
 
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" | "usage" }> | CompactionCostNotice;
@@ -450,6 +451,8 @@ export interface InteractiveModeOptions {
 
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
+	private extensionErrorSession: AgentSession | undefined;
+	private sessionInvalidated = false;
 	private renderer: TuiMainScreen | TuiAltScreen;
 	private ui: TUI;
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
@@ -497,7 +500,8 @@ export class InteractiveMode {
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: ThemedText | undefined = undefined;
-	private lastStatusMessage = "";
+	private lastStatusMessage = { text: "" };
+	private lastStatusIntent: TranscriptOutputIntent = "background";
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -531,9 +535,14 @@ export class InteractiveMode {
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
+	// Cover asynchronous user_bash interception before the session starts local execution.
+	private bashCommandPending: symbol | undefined;
 
 	// Track pending bash components (shown in pending area, moved to chat on submit)
-	private pendingBashComponents: BashExecutionComponent[] = [];
+	private pendingBashComponents = new Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">();
+
+	// Presentation ownership of native /compact invocations, not extension-triggered compaction.
+	private explicitCompactions = 0;
 
 	// Auto-compaction state
 	private autoCompactionEscapeHandler?: () => void;
@@ -606,15 +615,22 @@ export class InteractiveMode {
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.sessionInvalidated = true;
+			this.extensionErrorSession = undefined;
+			this.bashCommandPending = undefined;
 			this.resetExtensionUI();
 			this.transcriptPresentation.resetSession();
-			this.pendingBashComponents = [];
+			this.pendingBashComponents.clear();
+			this.bashComponent?.setComplete(undefined, true);
 			this.bashComponent = undefined;
 			this.entriesRenderedByBoundaryCompaction.clear();
 		});
 		this.runtimeHost.setRebindSession(async () => {
+			const session = this.session;
 			await this.rebindCurrentSession({ renderBeforeBind: true });
+			if (this.session !== session || this.extensionErrorSession !== session) return;
 			this.themeController.applyFromSettings();
+			this.sessionInvalidated = false;
 		});
 		this.version = VERSION;
 		this.renderer = createInteractiveTui({
@@ -1975,8 +1991,10 @@ export class InteractiveMode {
 	 * Initialize the extension system with TUI-based UI context.
 	 */
 	private async bindCurrentSessionExtensions(): Promise<void> {
+		const session = this.session;
+		this.extensionErrorSession = session;
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		await session.bindExtensions({
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
@@ -2038,6 +2056,7 @@ export class InteractiveMode {
 				}
 			},
 			onError: (error) => {
+				if (this.extensionErrorSession !== session) return;
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
 			},
 		});
@@ -3189,7 +3208,7 @@ export class InteractiveMode {
 
 	private handleStartupSubmit(text: string): void {
 		this.editor.setText(text);
-		this.showStatus("Startup is still in progress");
+		this.showStatus("Startup is still in progress", "explicit");
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -3313,7 +3332,7 @@ export class InteractiveMode {
 			}
 			if (text === "/reload") {
 				this.editor.setText("");
-				await this.handleReloadCommand();
+				await this.handleReloadCommand("explicit");
 				return;
 			}
 			if (text === "/debug") {
@@ -3347,15 +3366,31 @@ export class InteractiveMode {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
-					if (this.session.isBashRunning) {
-						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+					if (this.sessionInvalidated) {
+						this.showWarning(
+							"Session replacement is still in progress. Retry this command after it finishes.",
+							"explicit",
+						);
+						this.editor.setText(text);
+						return;
+					}
+					if (this.session.isBashRunning || this.bashCommandPending) {
+						this.showWarning("A bash command is already running. Press Esc to cancel it first.", "explicit");
 						this.editor.setText(text);
 						return;
 					}
 					this.editor.addToHistory?.(text);
-					await this.handleBashCommand(command, isExcluded);
-					this.isBashMode = false;
-					this.updateEditorBorderColor();
+					const reservation = Symbol("manual bash");
+					this.bashCommandPending = reservation;
+					try {
+						await this.handleBashCommand(command, isExcluded, reservation);
+					} finally {
+						if (this.bashCommandPending === reservation) {
+							this.bashCommandPending = undefined;
+							this.isBashMode = false;
+							this.updateEditorBorderColor();
+						}
+					}
 					return;
 				}
 			}
@@ -3516,6 +3551,7 @@ export class InteractiveMode {
 					);
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
+					this.transcriptPresentation.messagePresented(event.message, this.streamingComponent);
 					this.streamingComponent.updateContent(this.streamingMessage, true);
 					this.ui.requestRender();
 				}
@@ -3560,6 +3596,7 @@ export class InteractiveMode {
 				this.transcriptPresentation.messageEnded(event.message);
 				if (event.message.role === "user") break;
 				if (this.streamingComponent && event.message.role === "assistant") {
+					this.transcriptPresentation.messagePresented(event.message, this.streamingComponent);
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -3666,6 +3703,10 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				// The session flushes deferred bash records before this event.
+				for (const [component, state] of this.pendingBashComponents) {
+					if (state === "deferred") this.pendingBashComponents.set(component, "persisted");
+				}
 				await this.checkShutdownRequested();
 				break;
 
@@ -3684,6 +3725,7 @@ export class InteractiveMode {
 			}
 
 			case "compaction_end": {
+				const intent = event.reason === "manual" && this.explicitCompactions > 0 ? "explicit" : "background";
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
@@ -3694,7 +3736,7 @@ export class InteractiveMode {
 				this.clearStatusIndicator("compaction");
 				if (event.aborted) {
 					if (event.reason === "manual") {
-						this.showError("Compaction cancelled");
+						this.showError("Compaction cancelled", intent);
 					} else {
 						this.showStatus("Auto-compaction cancelled");
 					}
@@ -3713,18 +3755,22 @@ export class InteractiveMode {
 							event.result.tokensBefore,
 							new Date().toISOString(),
 						),
+						{ intent },
 					);
 					if (event.result.usage) {
-						this.addCompactionCostNotice({
-							type: "compaction_cost",
-							kind: "compaction",
-							usage: event.result.usage,
-						});
+						this.addCompactionCostNotice(
+							{
+								type: "compaction_cost",
+								kind: "compaction",
+								usage: event.result.usage,
+							},
+							intent,
+						);
 					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
-						this.showError(event.errorMessage);
+						this.showError(event.errorMessage, intent);
 					} else {
 						this.chatContainer.addChild(new Spacer(1));
 						const errorMessage = event.errorMessage;
@@ -3822,23 +3868,31 @@ export class InteractiveMode {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string): void {
+	private showStatus(message: string, intent: TranscriptOutputIntent = "background"): void {
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusMessage = message;
+		if (
+			last &&
+			secondLast &&
+			last === this.lastStatusText &&
+			secondLast === this.lastStatusSpacer &&
+			intent === this.lastStatusIntent
+		) {
+			this.lastStatusMessage.text = message;
 			this.lastStatusText.invalidate();
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		this.lastStatusMessage = message;
-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
-		this.chatContainer.addChild(spacer);
-		this.chatContainer.addChild(text);
+		const status = { text: message };
+		this.lastStatusMessage = status;
+		const text = new ThemedText(() => theme.fg("dim", status.text), 1, 0);
+		this.transcriptPresentation.addOutput(spacer, intent);
+		this.transcriptPresentation.addOutput(text, intent);
+		this.lastStatusIntent = intent;
 		this.lastStatusSpacer = spacer;
 		this.lastStatusText = text;
 		this.ui.requestRender();
@@ -3866,7 +3920,10 @@ export class InteractiveMode {
 		this.chatContainer.addChild(component);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private addMessageToChat(
+		message: AgentMessage,
+		options?: { populateHistory?: boolean; intent?: TranscriptOutputIntent },
+	): void {
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
@@ -3879,7 +3936,7 @@ export class InteractiveMode {
 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
 					message.fullOutputPath,
 				);
-				this.chatContainer.addChild(component);
+				this.transcriptPresentation.addExplicitOutput(component);
 				break;
 			}
 			case "custom": {
@@ -3897,17 +3954,17 @@ export class InteractiveMode {
 				break;
 			}
 			case "compactionSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				this.transcriptPresentation.addOutput(new Spacer(1), options?.intent);
 				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				this.transcriptPresentation.addOutput(component, options?.intent);
 				break;
 			}
 			case "branchSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				this.transcriptPresentation.addOutput(new Spacer(1), options?.intent);
 				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				this.transcriptPresentation.addOutput(component, options?.intent);
 				break;
 			}
 			case "system":
@@ -3927,6 +3984,7 @@ export class InteractiveMode {
 						);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
+						this.transcriptPresentation.messagePresented(message, component);
 						// Render user message separately if present
 						if (skillBlock.userMessage) {
 							this.chatContainer.addChild(new Spacer(1));
@@ -3937,6 +3995,7 @@ export class InteractiveMode {
 								this.getMarkdownTransformers(),
 							);
 							this.chatContainer.addChild(userComponent);
+							this.transcriptPresentation.messagePresented(message, userComponent);
 						}
 					} else {
 						const userComponent = new UserMessageComponent(
@@ -3946,6 +4005,7 @@ export class InteractiveMode {
 							this.getMarkdownTransformers(),
 						);
 						this.chatContainer.addChild(userComponent);
+						this.transcriptPresentation.messagePresented(message, userComponent);
 					}
 					if (options?.populateHistory) {
 						this.editor.addToHistory?.(textContent);
@@ -3963,6 +4023,7 @@ export class InteractiveMode {
 					this.getMarkdownTransformers(),
 				);
 				this.chatContainer.addChild(assistantComponent);
+				this.transcriptPresentation.messagePresented(message, assistantComponent);
 				break;
 			}
 			case "toolResult": {
@@ -3977,7 +4038,7 @@ export class InteractiveMode {
 
 	private renderSessionItems(
 		items: readonly RenderSessionItem[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+		options: { updateFooter?: boolean; populateHistory?: boolean; explicitBranchSummary?: AgentMessage } = {},
 	): void {
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
@@ -4002,7 +4063,7 @@ export class InteractiveMode {
 				continue;
 			}
 			if (isCompactionCostNotice(item)) {
-				this.addCompactionCostNotice(item);
+				this.addCompactionCostNotice(item, item.intent);
 				continue;
 			}
 
@@ -4057,8 +4118,11 @@ export class InteractiveMode {
 					renderedPendingTools.delete(message.toolCallId);
 				}
 			} else {
-				// All other messages use standard rendering
-				this.addMessageToChat(message, options);
+				// Only the summary returned by the native /tree invocation is an explicit exception.
+				this.addMessageToChat(message, {
+					populateHistory: options.populateHistory,
+					intent: message === options.explicitBranchSummary ? "explicit" : "background",
+				});
 			}
 		}
 
@@ -4076,19 +4140,37 @@ export class InteractiveMode {
 	 */
 	private renderSessionEntries(
 		entries: SessionEntry[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+		options: { updateFooter?: boolean; populateHistory?: boolean; explicitBranchSummaryId?: string } = {},
 	): void {
+		// Persisted dock output is represented by authoritative history after a rebuild.
+		// Keep active output and completed results still awaiting the session's flush.
+		for (const [component, state] of this.pendingBashComponents) {
+			if (state !== "persisted") continue;
+			this.pendingMessagesContainer.removeChild(component);
+			this.pendingBashComponents.delete(component);
+		}
+		let explicitBranchSummary: AgentMessage | undefined;
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
 			}
 			const messages = sessionEntryToContextMessages(entry);
+			const isRequestedSummary = entry.type === "branch_summary" && entry.id === options.explicitBranchSummaryId;
+			if (isRequestedSummary) explicitBranchSummary = messages[0];
 			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
-				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
+				return [
+					...messages,
+					{
+						type: "compaction_cost",
+						kind: entry.type,
+						usage: entry.usage,
+						intent: isRequestedSummary ? "explicit" : "background",
+					},
+				];
 			}
 			return messages;
 		});
-		this.renderSessionItems(items, options);
+		this.renderSessionItems(items, { ...options, explicitBranchSummary });
 	}
 
 	private addCacheWarmingUsage(entry: UsageEntry): void {
@@ -4102,16 +4184,17 @@ export class InteractiveMode {
 	 * Render billing usage for a compaction or branch summary. The notice is derived
 	 * from persisted summary usage and is not stored as a separate session entry.
 	 */
-	private addCompactionCostNotice(notice: CompactionCostNotice): void {
+	private addCompactionCostNotice(notice: CompactionCostNotice, intent: TranscriptOutputIntent = "background"): void {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;
 
 		const { usage } = notice;
 		const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 		const cost = usage.cost.total >= 0.01 ? ` (~$${usage.cost.total.toFixed(2)})` : "";
 		const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(
+		this.transcriptPresentation.addOutput(new Spacer(1), intent);
+		this.transcriptPresentation.addOutput(
 			new ThemedText(() => theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
+			intent,
 		);
 	}
 
@@ -4194,12 +4277,13 @@ export class InteractiveMode {
 		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
 	}
 
-	renderInitialMessages(): void {
+	renderInitialMessages(options: { explicitBranchSummaryId?: string } = {}): void {
 		const entries = this.sessionManager.buildContextEntries();
 		this.reconcilePresentedHistory(entries);
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
+			explicitBranchSummaryId: options.explicitBranchSummaryId,
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
@@ -4248,10 +4332,12 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
-		this.chatContainer.clear();
-		const entries = this.sessionManager.buildContextEntries();
-		this.reconcilePresentedHistory(entries);
-		this.renderSessionEntries(entries);
+		this.transcriptPresentation.rebuildPreservingExplicitOutput(this.bashComponent, () => {
+			this.chatContainer.clear();
+			const entries = this.sessionManager.buildContextEntries();
+			this.reconcilePresentedHistory(entries);
+			this.renderSessionEntries(entries);
+		});
 	}
 
 	// =========================================================================
@@ -4429,7 +4515,7 @@ export class InteractiveMode {
 
 	private handleCtrlZ(): void {
 		if (process.platform === "win32") {
-			this.showStatus("Suspend to background is not supported on Windows");
+			this.showStatus("Suspend to background is not supported on Windows", "explicit");
 			return;
 		}
 
@@ -4500,9 +4586,9 @@ export class InteractiveMode {
 	private handleDequeue(): void {
 		const restored = this.restoreQueuedMessagesToEditor();
 		if (restored === 0) {
-			this.showStatus("No queued messages to restore");
+			this.showStatus("No queued messages to restore", "explicit");
 		} else {
-			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
+			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`, "explicit");
 		}
 	}
 
@@ -4520,11 +4606,11 @@ export class InteractiveMode {
 	private cycleThinkingLevel(): void {
 		const newLevel = this.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
-			this.showStatus("Current model does not support thinking");
+			this.showStatus("Current model does not support thinking", "explicit");
 		} else {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(`Thinking level: ${newLevel}`);
+			this.showStatus(`Thinking level: ${newLevel}`, "explicit");
 		}
 	}
 
@@ -4533,17 +4619,17 @@ export class InteractiveMode {
 			const result = await this.session.cycleModel(direction);
 			if (result === undefined) {
 				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
-				this.showStatus(msg);
+				this.showStatus(msg, "explicit");
 			} else {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
-				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
+				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`, "explicit");
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(result.model);
 			}
 		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
+			this.showError(error instanceof Error ? error.message : String(error), "explicit");
 		}
 	}
 
@@ -4566,10 +4652,10 @@ export class InteractiveMode {
 	}
 
 	private toggleToolOutputExpansion(): void {
-		this.setToolsExpanded(!this.toolOutputExpanded);
+		this.setToolsExpanded(!this.toolOutputExpanded, "explicit");
 	}
 
-	private setToolsExpanded(expanded: boolean): void {
+	private setToolsExpanded(expanded: boolean, intent: TranscriptOutputIntent = "background"): void {
 		if (expanded === this.toolOutputExpanded) return;
 
 		this.toolOutputExpanded = expanded;
@@ -4584,7 +4670,7 @@ export class InteractiveMode {
 				}
 			}
 		}
-		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
+		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`, intent);
 	}
 
 	/** Update rendered assistant messages without rebuilding live tool components. */
@@ -4601,7 +4687,7 @@ export class InteractiveMode {
 		this.hideThinkingBlock = !this.hideThinkingBlock;
 		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
 		this.updateThinkingBlockVisibility();
-		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
+		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`, "explicit");
 	}
 
 	private async handleOpenExternalEditor(): Promise<void> {
@@ -4631,15 +4717,19 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showError(errorMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
+	showError(errorMessage: string, intent: TranscriptOutputIntent = "background"): void {
+		const spacer = new Spacer(1);
+		const text = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
+		this.transcriptPresentation.addOutput(spacer, intent);
+		this.transcriptPresentation.addOutput(text, intent);
 		this.ui.requestRender();
 	}
 
-	showWarning(warningMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+	showWarning(warningMessage: string, intent: TranscriptOutputIntent = "background"): void {
+		const spacer = new Spacer(1);
+		const text = new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0);
+		this.transcriptPresentation.addOutput(spacer, intent);
+		this.transcriptPresentation.addOutput(text, intent);
 		this.ui.requestRender();
 	}
 
@@ -4733,6 +4823,7 @@ export class InteractiveMode {
 
 	private updatePendingMessagesDisplay(): void {
 		this.pendingMessagesContainer.clear();
+		for (const component of this.pendingBashComponents.keys()) this.pendingMessagesContainer.addChild(component);
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.pendingMessagesContainer.addChild(new Spacer(1));
@@ -4870,11 +4961,11 @@ export class InteractiveMode {
 
 	/** Move pending bash components from pending area to chat */
 	private flushPendingBashComponents(): void {
-		for (const component of this.pendingBashComponents) {
+		for (const component of this.pendingBashComponents.keys()) {
 			this.pendingMessagesContainer.removeChild(component);
-			this.chatContainer.addChild(component);
+			this.transcriptPresentation.addExplicitOutput(component);
 		}
-		this.pendingBashComponents = [];
+		this.pendingBashComponents.clear();
 	}
 
 	// =========================================================================
@@ -5011,11 +5102,11 @@ export class InteractiveMode {
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
 						configureHttpDispatcher(timeoutMs);
-						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
+						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`, "explicit");
 					},
 					onCacheWarmingModeChange: (mode) => {
 						this.session.setCacheWarmingMode(mode);
-						this.showStatus(`Cache warming: ${mode}`);
+						this.showStatus(`Cache warming: ${mode}`, "explicit");
 					},
 					onModelThinkingLevelChange: (provider, modelId, level) => {
 						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
@@ -5129,12 +5220,12 @@ export class InteractiveMode {
 					onTuiModeChange: (mode) => {
 						if (!this.switchTuiMode(mode)) {
 							selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
-							this.showStatus("Close active overlays before changing TUI mode");
+							this.showStatus("Close active overlays before changing TUI mode", "explicit");
 							return;
 						}
 						this.settingsManager.setTuiMode(mode);
 						if (!this.activeStatusIndicator) this.statusContainer.clear();
-						this.showStatus(`TUI mode: ${mode}`);
+						this.showStatus(`TUI mode: ${mode}`, "explicit");
 					},
 					onFullscreenExitOutputChange: (output) => {
 						this.settingsManager.setFullscreenExitOutput(output);
@@ -5174,7 +5265,10 @@ export class InteractiveMode {
 		const normalized = searchTerm.trim().toLowerCase();
 		const level = availableLevels.find((candidate) => candidate.toLowerCase() === normalized);
 		if (!level) {
-			this.showError(`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`);
+			this.showError(
+				`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`,
+				"explicit",
+			);
 			return;
 		}
 
@@ -5186,9 +5280,9 @@ export class InteractiveMode {
 			this.session.setThinkingLevel(level, { persist });
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
+			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`, "explicit");
 		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
+			this.showError(error instanceof Error ? error.message : String(error), "explicit");
 		}
 	}
 
@@ -5225,10 +5319,10 @@ export class InteractiveMode {
 				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`Model: ${model.id}`);
+				this.showStatus(`Model: ${model.id}`, "explicit");
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 			} catch (error) {
-				this.showError(error instanceof Error ? error.message : String(error));
+				this.showError(error instanceof Error ? error.message : String(error), "explicit");
 			}
 			return;
 		}
@@ -5244,7 +5338,7 @@ export class InteractiveMode {
 		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
 		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
 
-		this.showStatus("Refreshing model catalogs…");
+		this.showStatus("Refreshing model catalogs…", "explicit");
 		const controller = new AbortController();
 		let timedOut = false;
 		const timeout = setTimeout(() => {
@@ -5254,15 +5348,19 @@ export class InteractiveMode {
 		try {
 			const result = await refreshModelCatalogs(this.session.modelRuntime, controller.signal);
 			if (result.aborted && timedOut) {
-				this.showWarning("Model refresh timed out; searching cached models.");
+				this.showWarning("Model refresh timed out; searching cached models.", "explicit");
 			} else if (result.errors.size > 0) {
-				this.showWarning(`Could not refresh ${[...result.errors.keys()].join(", ")}; searching cached models.`);
+				this.showWarning(
+					`Could not refresh ${[...result.errors.keys()].join(", ")}; searching cached models.`,
+					"explicit",
+				);
 			}
 		} catch (error) {
 			this.showWarning(
 				timedOut
 					? "Model refresh timed out; searching cached models."
 					: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
+				"explicit",
 			);
 		} finally {
 			clearTimeout(timeout);
@@ -5310,7 +5408,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private maybeSaveImplicitProjectTrustAfterReload(): boolean {
+	private maybeSaveImplicitProjectTrustAfterReload(intent: TranscriptOutputIntent): boolean {
 		const cwd = this.sessionManager.getCwd();
 		if (this.autoTrustOnReloadCwd !== cwd) {
 			return false;
@@ -5331,6 +5429,7 @@ export class InteractiveMode {
 		} catch (error) {
 			this.showWarning(
 				`Could not save project trust after reload: ${error instanceof Error ? error.message : String(error)}`,
+				intent,
 			);
 			return false;
 		}
@@ -5350,6 +5449,7 @@ export class InteractiveMode {
 					done();
 					this.showStatus(
 						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart ${APP_NAME} for this to take effect.`,
+						"explicit",
 					);
 				},
 				onCancel: () => {
@@ -5370,11 +5470,14 @@ export class InteractiveMode {
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
 					done();
-					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
+					this.showStatus(
+						persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`,
+						"explicit",
+					);
 					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				} catch (error) {
 					done();
-					this.showError(error instanceof Error ? error.message : String(error));
+					this.showError(error instanceof Error ? error.message : String(error), "explicit");
 				}
 			};
 			const defaultProvider = this.settingsManager.getDefaultProvider();
@@ -5464,7 +5567,7 @@ export class InteractiveMode {
 							enabledIds.every((id) => availableModelIds.has(id));
 						const newPatterns = enabledIds === null || allEnabled ? undefined : enabledIds;
 						this.settingsManager.setEnabledModels(newPatterns ? [...newPatterns] : undefined);
-						this.showStatus("Model selection saved to settings");
+						this.showStatus("Model selection saved to settings", "explicit");
 					},
 					onCancel: () => {
 						done();
@@ -5523,7 +5626,7 @@ export class InteractiveMode {
 		const userMessages = this.session.getUserMessagesForForking();
 
 		if (userMessages.length === 0) {
-			this.showStatus("No messages to fork from");
+			this.showStatus("No messages to fork from", "explicit");
 			return;
 		}
 
@@ -5542,9 +5645,9 @@ export class InteractiveMode {
 						}
 
 						this.editor.setText(result.selectedText ?? "");
-						this.showStatus("Forked to new session");
+						this.showStatus("Forked to new session", "explicit");
 					} catch (error: unknown) {
-						this.showError(error instanceof Error ? error.message : String(error));
+						this.showError(error instanceof Error ? error.message : String(error), "explicit");
 					}
 				},
 				() => {
@@ -5560,7 +5663,7 @@ export class InteractiveMode {
 	private async handleCloneCommand(): Promise<void> {
 		const leafId = this.sessionManager.getLeafId();
 		if (!leafId) {
-			this.showStatus("Nothing to clone yet");
+			this.showStatus("Nothing to clone yet", "explicit");
 			return;
 		}
 
@@ -5572,9 +5675,9 @@ export class InteractiveMode {
 			}
 
 			this.editor.setText("");
-			this.showStatus("Cloned to new session");
+			this.showStatus("Cloned to new session", "explicit");
 		} catch (error: unknown) {
-			this.showError(error instanceof Error ? error.message : String(error));
+			this.showError(error instanceof Error ? error.message : String(error), "explicit");
 		}
 	}
 
@@ -5584,7 +5687,7 @@ export class InteractiveMode {
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
 		if (tree.length === 0) {
-			this.showStatus("No entries in session");
+			this.showStatus("No entries in session", "explicit");
 			return;
 		}
 
@@ -5597,7 +5700,7 @@ export class InteractiveMode {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === this.sessionManager.getLeafId()) {
 						done();
-						this.showStatus("Already at this point");
+						this.showStatus("Already at this point", "explicit");
 						return;
 					}
 
@@ -5648,6 +5751,7 @@ export class InteractiveMode {
 					if (this.session.isCompacting) {
 						this.showError(
 							"Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+							"explicit",
 						);
 						return;
 					}
@@ -5674,25 +5778,25 @@ export class InteractiveMode {
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector with same selection
-							this.showStatus("Branch summarization cancelled");
+							this.showStatus("Branch summarization cancelled", "explicit");
 							this.showTreeSelector(entryId);
 							return;
 						}
 						if (result.cancelled) {
-							this.showStatus("Navigation cancelled");
+							this.showStatus("Navigation cancelled", "explicit");
 							return;
 						}
 
-						// Update UI
+						// Update UI with the exact newly requested summary, never historical summaries.
 						this.chatContainer.clear();
-						this.renderInitialMessages();
+						this.renderInitialMessages({ explicitBranchSummaryId: result.summaryEntry?.id });
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
 						}
-						this.showStatus("Navigated to selected point");
+						this.showStatus("Navigated to selected point", "explicit");
 						void this.flushCompactionQueue({ willRetry: false });
 					} catch (error) {
-						this.showError(error instanceof Error ? error.message : String(error));
+						this.showError(error instanceof Error ? error.message : String(error), "explicit");
 					} finally {
 						if (showingSummaryIndicator) {
 							this.clearStatusIndicator("branchSummary");
@@ -5713,14 +5817,14 @@ export class InteractiveMode {
 			);
 			selector.onCopy = async (text) => {
 				if (!text) {
-					this.showError("Selected entry has no text to copy");
+					this.showError("Selected entry has no text to copy", "explicit");
 					return;
 				}
 				try {
 					await copyToClipboard(text);
-					this.showStatus("Copied selected message to clipboard");
+					this.showStatus("Copied selected message to clipboard", "explicit");
 				} catch (error) {
-					this.showError(error instanceof Error ? error.message : String(error));
+					this.showError(error instanceof Error ? error.message : String(error), "explicit");
 				}
 			};
 			return { component: selector, focus: selector };
@@ -5743,7 +5847,7 @@ export class InteractiveMode {
 						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, signal),
 				async (sessionPath) => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					await this.handleResumeSession(sessionPath, undefined, "explicit");
 				},
 				() => {
 					done();
@@ -5773,6 +5877,7 @@ export class InteractiveMode {
 	private async handleResumeSession(
 		sessionPath: string,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
+		intent: TranscriptOutputIntent = "background",
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
 		try {
@@ -5783,13 +5888,13 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return result;
 			}
-			this.showStatus("Resumed session");
+			this.showStatus("Resumed session", intent);
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Resume cancelled");
+					this.showStatus("Resume cancelled", intent);
 					return { cancelled: true };
 				}
 				const result = await this.runtimeHost.switchSession(sessionPath, {
@@ -5800,7 +5905,7 @@ export class InteractiveMode {
 				if (result.cancelled) {
 					return result;
 				}
-				this.showStatus("Resumed session in current cwd");
+				this.showStatus("Resumed session in current cwd", intent);
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -5929,7 +6034,7 @@ export class InteractiveMode {
 		if (radiusLabel) options.push(radiusLabel);
 
 		if (options.length === 0) {
-			this.showStatus("No login methods available.");
+			this.showStatus("No login methods available.", "explicit");
 			return;
 		}
 
@@ -5989,7 +6094,7 @@ export class InteractiveMode {
 					: authType === "api_key"
 						? "No API key providers available."
 						: "No login providers available.";
-			this.showStatus(message);
+			this.showStatus(message, "explicit");
 			return;
 		}
 
@@ -6035,12 +6140,16 @@ export class InteractiveMode {
 		try {
 			providerOptions = await this.getLogoutProviderOptions();
 		} catch (error) {
-			this.showError(`Could not read stored credentials: ${error instanceof Error ? error.message : String(error)}`);
+			this.showError(
+				`Could not read stored credentials: ${error instanceof Error ? error.message : String(error)}`,
+				"explicit",
+			);
 			return;
 		}
 		if (providerOptions.length === 0) {
 			this.showStatus(
 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
+				"explicit",
 			);
 			return;
 		}
@@ -6066,13 +6175,14 @@ export class InteractiveMode {
 							providerOption.authType === "oauth"
 								? `Logged out of ${providerOption.name}`
 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
-						this.showStatus(message);
+						this.showStatus(message, "explicit");
 					} catch (error: unknown) {
 						const message = error instanceof Error ? error.message : String(error);
 						this.showError(
 							error instanceof CredentialSynchronizationError
 								? `Credentials removed for ${providerOption.name}, but local model state could not be synchronized: ${message}`
 								: `Logout failed: ${message}`,
+							"explicit",
 						);
 					}
 				},
@@ -6138,19 +6248,25 @@ export class InteractiveMode {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			if (selectedModel) {
-				this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(
+					`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`,
+					"explicit",
+				);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
 			} else {
-				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`, "explicit");
 				if (selectionError) {
-					this.showError(selectionError);
+					this.showError(selectionError, "explicit");
 				} else {
 					void this.maybeWarnAboutAnthropicSubscriptionAuth();
 				}
 			}
 		};
 		if (deferSelection) {
-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`);
+			this.showStatus(
+				`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`,
+				"explicit",
+			);
 		} else {
 			await finishAuthentication();
 		}
@@ -6161,9 +6277,15 @@ export class InteractiveMode {
 			.refresh({ providers: [providerId], signal: controller.signal })
 			.then(async (result) => {
 				if (result.aborted) {
-					this.showWarning(`${actionLabel}, but its model catalog refresh timed out; using cached models.`);
+					this.showWarning(
+						`${actionLabel}, but its model catalog refresh timed out; using cached models.`,
+						"explicit",
+					);
 				} else if (result.errors.size > 0) {
-					this.showWarning(`${actionLabel}, but its model catalog could not be refreshed; using cached models.`);
+					this.showWarning(
+						`${actionLabel}, but its model catalog could not be refreshed; using cached models.`,
+						"explicit",
+					);
 				}
 				// Do not replace a model or session selected while the refresh was running.
 				if (deferSelection && this.session === session && session.model === previousModel) {
@@ -6176,6 +6298,7 @@ export class InteractiveMode {
 			.catch((error: unknown) => {
 				this.showWarning(
 					`${actionLabel}, but its model catalog could not be refreshed: ${error instanceof Error ? error.message : String(error)}`,
+					"explicit",
 				);
 			})
 			.finally(() => clearTimeout(timeout));
@@ -6253,11 +6376,12 @@ export class InteractiveMode {
 			if (error instanceof CredentialSynchronizationError) {
 				this.showError(
 					`Saved API key for ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
+					"explicit",
 				);
 			} else if (errorMsg === "Login cancelled") {
 				onBack?.();
 			} else {
-				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
+				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`, "explicit");
 			}
 		}
 	}
@@ -6377,11 +6501,12 @@ export class InteractiveMode {
 			if (error instanceof CredentialSynchronizationError) {
 				this.showError(
 					`Logged in to ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
+					"explicit",
 				);
 			} else if (errorMsg === "Login cancelled") {
 				onBack?.();
 			} else {
-				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
+				this.showError(`Failed to login to ${providerName}: ${errorMsg}`, "explicit");
 			}
 		}
 	}
@@ -6424,11 +6549,12 @@ export class InteractiveMode {
 					} catch (error: unknown) {
 						this.showError(
 							`Could not update ${mcpPath}: ${error instanceof Error ? error.message : String(error)}`,
+							"explicit",
 						);
 						return;
 					}
 					// The MCP extension reads mcp.json when the session starts.
-					void this.handleReloadCommand();
+					void this.handleReloadCommand("explicit");
 				},
 				() => {
 					done();
@@ -6443,13 +6569,13 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
-	private async handleReloadCommand(): Promise<void> {
+	private async handleReloadCommand(intent: TranscriptOutputIntent = "background"): Promise<void> {
 		if (this.session.isStreaming) {
-			this.showWarning("Wait for the current response to finish before reloading.");
+			this.showWarning("Wait for the current response to finish before reloading.", intent);
 			return;
 		}
 		if (this.session.isCompacting) {
-			this.showWarning("Wait for compaction to finish before reloading.");
+			this.showWarning("Wait for compaction to finish before reloading.", intent);
 			return;
 		}
 
@@ -6514,15 +6640,16 @@ export class InteractiveMode {
 				force: false,
 				showDiagnosticsWhenQuiet: true,
 			});
-			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload();
+			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload(intent);
 			const modelsJsonError = this.session.modelRuntime.getError();
 			if (modelsJsonError) {
-				this.showError(`models.json error: ${modelsJsonError}`);
+				this.showError(`models.json error: ${modelsJsonError}`, intent);
 			}
 			this.showStatus(
 				savedImplicitProjectTrust
 					? "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
 					: "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+				intent,
 			);
 			dismissReloadBox(this.editor as Component);
 			reloadBoxDismissed = true;
@@ -6530,7 +6657,7 @@ export class InteractiveMode {
 			if (!reloadBoxDismissed) {
 				dismissReloadBox(previousEditor as Component);
 			}
-			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`, intent);
 		}
 	}
 
@@ -6540,15 +6667,18 @@ export class InteractiveMode {
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
 				const filePath = this.session.exportToJsonl(outputPath);
-				this.showStatus(`Session exported to: ${filePath}`);
+				this.showStatus(`Session exported to: ${filePath}`, "explicit");
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath, {
 					themeName: theme.name,
 				});
-				this.showStatus(`Session exported to: ${filePath}`);
+				this.showStatus(`Session exported to: ${filePath}`, "explicit");
 			}
 		} catch (error: unknown) {
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.showError(
+				`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`,
+				"explicit",
+			);
 		}
 	}
 
@@ -6584,13 +6714,13 @@ export class InteractiveMode {
 	private async handleImportCommand(text: string): Promise<void> {
 		const inputPath = this.getPathCommandArgument(text, "/import");
 		if (!inputPath) {
-			this.showError("Usage: /import <path.jsonl>");
+			this.showError("Usage: /import <path.jsonl>", "explicit");
 			return;
 		}
 
 		const confirmed = await this.showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`);
 		if (!confirmed) {
-			this.showStatus("Import cancelled");
+			this.showStatus("Import cancelled", "explicit");
 			return;
 		}
 
@@ -6598,27 +6728,27 @@ export class InteractiveMode {
 			this.clearStatusIndicator();
 			const result = await this.runtimeHost.importFromJsonl(inputPath);
 			if (result.cancelled) {
-				this.showStatus("Import cancelled");
+				this.showStatus("Import cancelled", "explicit");
 				return;
 			}
-			this.showStatus(`Session imported from: ${inputPath}`);
+			this.showStatus(`Session imported from: ${inputPath}`, "explicit");
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Import cancelled");
+					this.showStatus("Import cancelled", "explicit");
 					return;
 				}
 				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 				if (result.cancelled) {
-					this.showStatus("Import cancelled");
+					this.showStatus("Import cancelled", "explicit");
 					return;
 				}
-				this.showStatus(`Session imported from: ${inputPath}`);
+				this.showStatus(`Session imported from: ${inputPath}`, "explicit");
 				return;
 			}
 			if (error instanceof SessionImportFileNotFoundError) {
-				this.showError(`Failed to import session: ${error.message}`);
+				this.showError(`Failed to import session: ${error.message}`, "explicit");
 				return;
 			}
 			await this.handleFatalRuntimeError("Failed to import session", error);
@@ -6631,8 +6761,8 @@ export class InteractiveMode {
 			ui: this.ui,
 			editorContainer: this.editorContainer,
 			editor: this.editor,
-			showStatus: (message) => this.showStatus(message),
-			showError: (message) => this.showError(message),
+			showStatus: (message) => this.showStatus(message, "explicit"),
+			showError: (message) => this.showError(message, "explicit"),
 		});
 	}
 
@@ -6644,8 +6774,8 @@ export class InteractiveMode {
 				editorContainer: this.editorContainer,
 				editor: this.editor,
 				keybindings: this.keybindings,
-				showStatus: (message) => this.showStatus(message),
-				showError: (message) => this.showError(message),
+				showStatus: (message) => this.showStatus(message, "explicit"),
+				showError: (message) => this.showError(message, "explicit"),
 			},
 			hint,
 		);
@@ -6666,7 +6796,7 @@ export class InteractiveMode {
 
 		const text = this.session.getLastAssistantText();
 		if (!text) {
-			this.showError("No agent messages to copy yet.");
+			this.showError("No agent messages to copy yet.", "explicit");
 			return;
 		}
 
@@ -6675,10 +6805,10 @@ export class InteractiveMode {
 			if (options.flashConfirmation && this.ui instanceof TuiAltScreen) {
 				this.ui.flash("Copied!");
 			} else {
-				this.showStatus("Copied last agent message to clipboard");
+				this.showStatus("Copied last agent message to clipboard", "explicit");
 			}
 		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
+			this.showError(error instanceof Error ? error.message : String(error), "explicit");
 		}
 	}
 
@@ -6687,10 +6817,12 @@ export class InteractiveMode {
 		if (!name) {
 			const currentName = this.sessionManager.getSessionName();
 			if (currentName) {
-				this.chatContainer.addChild(new Spacer(1));
-				this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", `Session name: ${currentName}`), 1, 0));
+				this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+				this.transcriptPresentation.addExplicitOutput(
+					new ThemedText(() => theme.fg("dim", `Session name: ${currentName}`), 1, 0),
+				);
 			} else {
-				this.showWarning("Usage: /name <name>");
+				this.showWarning("Usage: /name <name>", "explicit");
 			}
 			this.ui.requestRender();
 			return;
@@ -6699,11 +6831,16 @@ export class InteractiveMode {
 		this.session.setSessionName(name);
 		const sessionName = this.sessionManager.getSessionName();
 		if (sessionName !== name) {
-			this.showWarning(`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`);
+			this.showWarning(
+				`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`,
+				"explicit",
+			);
 		}
-		this.chatContainer.addChild(new Spacer(1));
+		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
 		const displayName = sessionName ?? name;
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", `Session name set: ${displayName}`), 1, 0));
+		this.transcriptPresentation.addExplicitOutput(
+			new ThemedText(() => theme.fg("dim", `Session name set: ${displayName}`), 1, 0),
+		);
 		this.ui.requestRender();
 	}
 
@@ -6783,8 +6920,8 @@ export class InteractiveMode {
 			return info;
 		};
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(renderInfo, 1, 0));
+		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+		this.transcriptPresentation.addExplicitOutput(new ThemedText(renderInfo, 1, 0));
 		this.ui.requestRender();
 	}
 
@@ -6800,12 +6937,14 @@ export class InteractiveMode {
 						.join("\n\n")
 				: "No changelog entries found.";
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
+		const output = new Container();
+		output.addChild(new Spacer(1));
+		output.addChild(new DynamicBorder());
+		output.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
+		output.addChild(new Spacer(1));
+		output.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
+		output.addChild(new DynamicBorder());
+		this.transcriptPresentation.addExplicitOutput(output);
 		this.ui.requestRender();
 	}
 
@@ -6933,12 +7072,14 @@ export class InteractiveMode {
 			}
 		}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
-		this.chatContainer.addChild(new DynamicBorder());
+		const output = new Container();
+		output.addChild(new Spacer(1));
+		output.addChild(new DynamicBorder());
+		output.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
+		output.addChild(new Spacer(1));
+		output.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
+		output.addChild(new DynamicBorder());
+		this.transcriptPresentation.addExplicitOutput(output);
 		this.ui.requestRender();
 	}
 
@@ -6949,8 +7090,10 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return;
 			}
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1));
+			this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+			this.transcriptPresentation.addExplicitOutput(
+				new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1),
+			);
 			this.ui.requestRender();
 		} catch (error: unknown) {
 			await this.handleFatalRuntimeError("Failed to create session", error);
@@ -6983,8 +7126,8 @@ export class InteractiveMode {
 		fs.mkdirSync(path.dirname(debugLogPath), { recursive: true });
 		fs.writeFileSync(debugLogPath, debugData);
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(
+		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+		this.transcriptPresentation.addExplicitOutput(
 			new ThemedText(() => `${theme.fg("accent", "✓ Debug log written")}\n${theme.fg("muted", debugLogPath)}`, 1, 1),
 		);
 		this.ui.requestRender();
@@ -6992,19 +7135,21 @@ export class InteractiveMode {
 
 	private handleArminSaysHi(): void {
 		if (playArmin3d(this.renderer)) return;
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ArminComponent(this.ui));
+		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+		this.transcriptPresentation.addExplicitOutput(new ArminComponent(this.ui));
 		this.ui.requestRender();
 	}
 
 	private handleDementedDelves(): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new EarendilAnnouncementComponent());
+		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+		this.transcriptPresentation.addExplicitOutput(new EarendilAnnouncementComponent());
 		this.ui.requestRender();
 	}
 
-	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
+	private async handleBashCommand(command: string, excludeFromContext: boolean, reservation: symbol): Promise<void> {
+		const session = this.session;
+		const extensionRunner = session.extensionRunner;
+		const isCurrent = () => this.session === session && this.bashCommandPending === reservation;
 
 		// Emit user_bash event to let extensions intercept
 		let eventResult: UserBashEventResult | undefined;
@@ -7015,10 +7160,15 @@ export class InteractiveMode {
 				excludeFromContext,
 				cwd: this.sessionManager.getCwd(),
 			});
-		} catch {
-			// The extension runner already reported the error. Do not fall back to local execution.
+		} catch (error) {
+			if (!isCurrent()) return;
+			// Keep the extension diagnostic in ordinary output and expose the manual command's failure.
+			// Never fall back to local execution when interception fails.
+			this.showError(`Bash command failed: ${error instanceof Error ? error.message : String(error)}`, "explicit");
 			return;
 		}
+
+		if (!isCurrent()) return;
 
 		// If extension returned a full result, use it directly
 		if (eventResult?.result) {
@@ -7028,9 +7178,9 @@ export class InteractiveMode {
 			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
 			if (this.session.isStreaming) {
 				this.pendingMessagesContainer.addChild(this.bashComponent);
-				this.pendingBashComponents.push(this.bashComponent);
+				this.pendingBashComponents.set(this.bashComponent, "unrecorded");
 			} else {
-				this.chatContainer.addChild(this.bashComponent);
+				this.transcriptPresentation.addExplicitOutput(this.bashComponent);
 			}
 
 			// Show output and complete
@@ -7045,51 +7195,59 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			session.recordBashResult(command, result, { excludeFromContext });
+			if (this.pendingBashComponents.has(this.bashComponent)) {
+				this.pendingBashComponents.set(
+					this.bashComponent,
+					session.hasPendingBashMessages ? "deferred" : "persisted",
+				);
+			}
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
 		}
 
 		// Normal execution path (possibly with custom operations)
-		const isDeferred = this.session.isStreaming;
-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		const isDeferred = session.isStreaming;
+		const component = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		this.bashComponent = component;
 
 		if (isDeferred) {
 			// Show in pending area when agent is streaming
 			this.pendingMessagesContainer.addChild(this.bashComponent);
-			this.pendingBashComponents.push(this.bashComponent);
+			this.pendingBashComponents.set(this.bashComponent, "unrecorded");
 		} else {
 			// Show in chat immediately when agent is idle
-			this.chatContainer.addChild(this.bashComponent);
+			this.transcriptPresentation.addExplicitOutput(this.bashComponent);
 		}
 		this.ui.requestRender();
 
 		try {
-			const result = await this.session.executeBash(
+			const result = await session.executeBash(
 				command,
 				(chunk) => {
-					if (this.bashComponent) {
-						this.bashComponent.appendOutput(chunk);
+					if (isCurrent()) {
+						component.appendOutput(chunk);
 						this.ui.requestRender();
 					}
 				},
 				{ excludeFromContext, operations: eventResult?.operations },
 			);
 
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(
-					result.exitCode,
-					result.cancelled,
-					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
-					result.fullOutputPath,
-				);
+			if (!isCurrent()) return;
+			if (this.pendingBashComponents.has(component)) {
+				this.pendingBashComponents.set(component, session.hasPendingBashMessages ? "deferred" : "persisted");
 			}
+			component.setComplete(
+				result.exitCode,
+				result.cancelled,
+				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+				result.fullOutputPath,
+			);
 		} catch (error) {
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(undefined, false);
-			}
-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+			if (!isCurrent()) return;
+			component.setComplete(undefined, false);
+			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`, "explicit");
 		}
 
 		this.bashComponent = undefined;
@@ -7099,10 +7257,13 @@ export class InteractiveMode {
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {
 		this.clearStatusIndicator();
 
+		this.explicitCompactions++;
 		try {
 			await this.session.compact(customInstructions);
 		} catch {
 			// Ignore, will be emitted as an event
+		} finally {
+			this.explicitCompactions--;
 		}
 	}
 

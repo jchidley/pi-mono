@@ -2,8 +2,10 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { SessionEntry } from "../src/core/session-manager.ts";
+import type { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 describe("InteractiveMode compaction events", () => {
@@ -17,7 +19,11 @@ describe("InteractiveMode compaction events", () => {
 			cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.065, total: 0.125 },
 		};
 		const addCompactionCostNotice = Reflect.get(InteractiveMode.prototype, "addCompactionCostNotice") as (
-			this: { chatContainer: Container; settingsManager: { getShowCacheMissNotices(): boolean } },
+			this: {
+				chatContainer: Container;
+				transcriptPresentation: TranscriptPresentation;
+				settingsManager: { getShowCacheMissNotices(): boolean };
+			},
 			notice: {
 				type: "compaction_cost";
 				kind: "compaction" | "branch_summary";
@@ -26,10 +32,23 @@ describe("InteractiveMode compaction events", () => {
 		) => void;
 
 		initTheme("dark");
-		const enabled = {
-			chatContainer: new Container(),
-			settingsManager: { getShowCacheMissNotices: () => true },
+		const createContext = (showNotices: boolean) => {
+			const chatContainer = new Container();
+			return {
+				chatContainer,
+				transcriptPresentation: new TranscriptPresentation({
+					header: new Container(),
+					resources: new Container(),
+					transcript: chatContainer,
+					pendingOutput: new Container(),
+					getMarkdownTheme,
+					getOutputPad: () => 1,
+					getMarkdownTransformers: () => [],
+				}),
+				settingsManager: { getShowCacheMissNotices: () => showNotices },
+			};
 		};
+		const enabled = createContext(true);
 		addCompactionCostNotice.call(enabled, { type: "compaction_cost", kind: "compaction", usage });
 		addCompactionCostNotice.call(enabled, {
 			type: "compaction_cost",
@@ -40,10 +59,7 @@ describe("InteractiveMode compaction events", () => {
 		expect(output).toContain("Compaction: 100 tokens billed (~$0.13)");
 		expect(output).toContain("Branch summary: 100 tokens billed (~$0.13)");
 
-		const disabled = {
-			chatContainer: new Container(),
-			settingsManager: { getShowCacheMissNotices: () => false },
-		};
+		const disabled = createContext(false);
 		addCompactionCostNotice.call(disabled, { type: "compaction_cost", kind: "compaction", usage });
 		expect(disabled.chatContainer.children).toHaveLength(0);
 	});
@@ -87,7 +103,11 @@ describe("InteractiveMode compaction events", () => {
 				usage: previousUsage,
 			},
 		];
-		const fakeThis = { renderSessionItems: vi.fn() };
+		const fakeThis = {
+			pendingBashComponents: new Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">(),
+			pendingMessagesContainer: new Container(),
+			renderSessionItems: vi.fn(),
+		};
 		const renderSessionEntries = Reflect.get(InteractiveMode.prototype, "renderSessionEntries") as (
 			this: typeof fakeThis,
 			entries: SessionEntry[],
@@ -98,11 +118,11 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.renderSessionItems).toHaveBeenCalledWith(
 			[
 				expect.objectContaining({ role: "compactionSummary", summary: "current summary" }),
-				{ type: "compaction_cost", kind: "compaction", usage: currentUsage },
+				{ type: "compaction_cost", kind: "compaction", usage: currentUsage, intent: "background" },
 				expect.objectContaining({ role: "compactionSummary", summary: "previous summary" }),
-				{ type: "compaction_cost", kind: "compaction", usage: previousUsage },
+				{ type: "compaction_cost", kind: "compaction", usage: previousUsage, intent: "background" },
 			],
-			{},
+			{ explicitBranchSummary: undefined },
 		);
 	});
 
@@ -189,12 +209,12 @@ describe("InteractiveMode compaction events", () => {
 				tokensBefore: 123,
 				summary: "summary",
 			}),
+			{ intent: "background" },
 		);
-		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith({
-			type: "compaction_cost",
-			kind: "compaction",
-			usage,
-		});
+		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith(
+			{ type: "compaction_cost", kind: "compaction", usage },
+			"background",
+		);
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
 
