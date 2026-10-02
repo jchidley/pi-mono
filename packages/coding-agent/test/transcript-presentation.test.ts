@@ -1,8 +1,137 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
 
-describe("ordinary transcript presentation", () => {
+describe("transcript presentation", () => {
+	beforeEach(() => initTheme("dark"));
+	it("switches to user text and completed answers while ordinary live output keeps growing", () => {
+		const transcript = new Container();
+		const partial = new Text("partial answer", 0, 0);
+		transcript.addChild(partial);
+		const presentation = new TranscriptPresentation({
+			header: new Text("header", 0, 0),
+			resources: new Text("loaded resources", 0, 0),
+			transcript,
+			pendingOutput: new Text("queued input", 0, 0),
+			getMarkdownTheme,
+			getOutputPad: () => 1,
+			getMarkdownTransformers: () => [],
+		});
+		presentation.replaceHistory([{ role: "user", content: "hello focus", timestamp: 1 }]);
+		presentation.toggleFocus();
+		const visible = () => presentation.document.render(80).join("\n");
+		expect(visible()).toContain("hello focus");
+		expect(visible()).not.toContain("partial answer");
+		expect(visible()).not.toContain("loaded resources");
+		partial.setText("latest partial answer");
+		transcript.addChild(new Text("latest tool output", 0, 0));
+		presentation.messageEnded(fauxAssistantMessage("completed answer"));
+		expect(visible()).toContain("completed answer");
+		presentation.toggleFocus();
+		expect(visible()).toContain("latest partial answer");
+		expect(visible()).toContain("latest tool output");
+		presentation.toggleFocus();
+		expect(visible().match(/completed answer/g)).toHaveLength(1);
+		expect(presentation.pendingOutput.render(80).join("\n")).toContain("queued input");
+	});
+	it("projects only user text and successful tool-free answers without mutating history", () => {
+		const presentation = new TranscriptPresentation({
+			header: new Text("header", 0, 0),
+			resources: new Text("resources", 0, 0),
+			transcript: new Text("ordinary", 0, 0),
+			pendingOutput: new Text("pending", 0, 0),
+			getMarkdownTheme,
+			getOutputPad: () => 1,
+			getMarkdownTransformers: () => [],
+		});
+		const history: AgentMessage[] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "user words" },
+					{ type: "image", data: "image bytes", mimeType: "image/png" },
+				],
+				timestamp: 1,
+			},
+			{
+				role: "user",
+				content: '<skill name="example" location="/tmp/SKILL.md">\nexpanded skill body\n</skill>\n\nmy own request',
+				timestamp: 2,
+			},
+			{
+				role: "user",
+				content: 'inspect this\n<file name="/tmp/attached.txt">attachment body</file>\nplease',
+				timestamp: 3,
+			},
+			fauxAssistantMessage([
+				{ type: "thinking", thinking: "secret reasoning" },
+				{ type: "text", text: "successful answer" },
+			]),
+			...(["length", "error", "aborted", "toolUse"] as const).map((stopReason) =>
+				fauxAssistantMessage(`excluded ${stopReason}`, { stopReason }),
+			),
+			fauxAssistantMessage([{ type: "text", text: "tool-bearing stop" }, fauxToolCall("echo", {})], {
+				stopReason: "stop",
+			}),
+			{ role: "custom", customType: "background", content: "unsolicited custom", display: true, timestamp: 4 },
+			{ role: "compactionSummary", summary: "hidden summary", tokensBefore: 100, timestamp: 5 },
+			{
+				role: "bashExecution",
+				command: "echo",
+				output: "deferred output",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 6,
+			},
+		];
+		const original = structuredClone(history);
+		presentation.replaceHistory(history);
+		presentation.messageStarted(fauxAssistantMessage("streaming text"));
+		presentation.messageStarted({ role: "user", content: "live user", timestamp: 7 });
+		presentation.toggleFocus();
+		const output = presentation.document.render(100).join("\n");
+		for (const text of ["user words", "my own request", "inspect this", "please", "successful answer", "live user"])
+			expect(output).toContain(text);
+		for (const text of [
+			"image bytes",
+			"expanded skill body",
+			"attachment body",
+			"secret reasoning",
+			"Thinking",
+			"excluded",
+			"tool-bearing stop",
+			"unsolicited custom",
+			"hidden summary",
+			"deferred output",
+			"streaming text",
+		])
+			expect(output).not.toContain(text);
+		expect(history).toEqual(original);
+	});
+
+	it("does not present a deferred answer as completed even if it has a stop reason", () => {
+		const presentation = new TranscriptPresentation({
+			header: new Text("header", 0, 0),
+			resources: new Text("resources", 0, 0),
+			transcript: new Text("ordinary", 0, 0),
+			pendingOutput: new Text("pending", 0, 0),
+			getMarkdownTheme,
+			getOutputPad: () => 1,
+			getMarkdownTransformers: () => [],
+		});
+		const message = fauxAssistantMessage("deferred answer", {
+			deferred: { provider: "faux", modelId: "faux-1", api: "faux", id: "pending-response" },
+		});
+		presentation.replaceHistory([message]);
+		presentation.messageEnded(message);
+		presentation.toggleFocus();
+		expect(presentation.document.render(80).join("\n")).not.toContain("deferred answer");
+	});
+
 	it("presents header, resources and live transcript in order, with pending output on its own surface", () => {
 		const transcript = new Container();
 		const assistant = new Text("assistant: starting", 0, 0);
@@ -14,6 +143,9 @@ describe("ordinary transcript presentation", () => {
 			resources: new Text("loaded resources", 0, 0),
 			transcript,
 			pendingOutput: pending,
+			getMarkdownTheme,
+			getOutputPad: () => 1,
+			getMarkdownTransformers: () => [],
 		});
 
 		expect(presentation.document.render(80).map((line) => line.trimEnd())).toEqual([

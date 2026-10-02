@@ -633,6 +633,9 @@ export class InteractiveMode {
 			resources: this.loadedResourcesContainer,
 			transcript: this.chatContainer,
 			pendingOutput: this.pendingMessagesContainer,
+			getMarkdownTheme: () => this.getMarkdownThemeWithSettings(),
+			getOutputPad: () => this.outputPad,
+			getMarkdownTransformers: () => this.getMarkdownTransformers(),
 		});
 		this.statusContainer = new Container();
 		this.widgetContainerAbove = new Container();
@@ -3091,6 +3094,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.transcript.toggleFinalOnly", () => this.toggleFocus());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction(
 			"app.message.copy",
@@ -3183,6 +3187,9 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+
+			// Local presentation commands run before every execution/queuing path.
+			if (this.handleFocusCommand(text)) return;
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3480,6 +3487,7 @@ export class InteractiveMode {
 				break;
 
 			case "message_start":
+				this.transcriptPresentation.messageStarted(event.message);
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
@@ -3539,6 +3547,7 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
+				this.transcriptPresentation.messageEnded(event.message);
 				if (event.message.role === "user") break;
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
@@ -4170,6 +4179,7 @@ export class InteractiveMode {
 
 	renderInitialMessages(): void {
 		const entries = this.sessionManager.buildContextEntries();
+		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -4438,6 +4448,7 @@ export class InteractiveMode {
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
+		if (this.handleFocusCommand(text)) return;
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -4515,6 +4526,24 @@ export class InteractiveMode {
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	private handleFocusCommand(text: string): boolean {
+		if (text !== "/focus") return false;
+		this.toggleFocus();
+		this.editor.setText("");
+		return true;
+	}
+
+	private toggleFocus(): void {
+		if (this.renderer.mode !== "fullscreen") {
+			this.showStatus("Focus requires fullscreen mode. Enable it in /settings.");
+			return;
+		}
+		this.transcriptPresentation.toggleFocus();
+		this.transcriptScrollView?.scrollToEnd();
+		this.ui.invalidate();
+		this.ui.requestRender();
 	}
 
 	private toggleToolOutputExpansion(): void {
@@ -6809,6 +6838,7 @@ export class InteractiveMode {
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
+		const toggleFocus = this.getAppKeyDisplay("app.transcript.toggleFinalOnly");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const cycleModelBackward = this.getAppKeyDisplay("app.model.cycleBackward");
 		const copyMessage = this.getAppKeyDisplay("app.message.copy");
@@ -6854,6 +6884,7 @@ export class InteractiveMode {
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
+| \`${toggleFocus}\` | Toggle fullscreen focus |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${copyMessage}\` | Copy selection or last assistant message |
 | \`${followUp}\` | Queue follow-up message |
