@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type Component, Container, type Focusable, type TUI } from "../../tui/src/tui.ts";
 import { TuiMainScreen } from "../../tui/src/tui-main-screen.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
+import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
 import type { QuietStartup } from "../src/core/settings-manager.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
@@ -12,6 +13,8 @@ import type { AuthSelectorProvider } from "../src/modes/interactive/components/o
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
+import * as toolsManager from "../src/utils/tools-manager.ts";
+import { createHarness } from "./suite/harness.ts";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -143,24 +146,42 @@ describe("InteractiveMode.showStatus", () => {
 describe("InteractiveMode.showManagedToolStatus", () => {
 	beforeAll(() => initTheme("dark"));
 
-	test("renders tool updates as one contiguous group", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
-			ui: { requestRender: vi.fn() },
-			managedToolStatusStarted: false,
-			lastStatusSpacer: undefined,
-			lastStatusText: undefined,
-		};
-		const showManagedToolStatus = (InteractiveMode as any).prototype.showManagedToolStatus;
-
-		showManagedToolStatus.call(fakeThis, { type: "info", message: "fd downloading" });
-		showManagedToolStatus.call(fakeThis, { type: "info", message: "rg downloading" });
-		showManagedToolStatus.call(fakeThis, { type: "warning", message: "rg failed" });
-
-		expect(fakeThis.chatContainer.children).toHaveLength(4);
-		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toBe(
-			"fd downloading\n rg downloading\n Warning: rg failed",
+	test("renders tool updates as one contiguous group", async () => {
+		const installer = vi.spyOn(toolsManager, "ensureTool").mockImplementation(async (tool, onStatus) => {
+			onStatus?.({ type: "info", message: `${tool} downloading` });
+			if (tool === "rg") onStatus?.({ type: "warning", message: "rg failed" });
+			return undefined;
+		});
+		const harness = await createHarness({ settings: { theme: "dark", quietStartup: true } });
+		const terminal = new VirtualTerminal(120, 60);
+		const runtime = new AgentSessionRuntime(
+			harness.session,
+			{
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("Session replacement is outside this managed-tool scenario");
+			},
 		);
+		const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
+		try {
+			await mode.init();
+			await terminal.waitForRender();
+			const output = terminal
+				.getViewport()
+				.map((line) => line.trimEnd())
+				.join("\n");
+			expect(output).toContain(" fd downloading\n rg downloading\n Warning: rg failed");
+		} finally {
+			mode.stop("resume-hint");
+			harness.cleanup();
+			installer.mockRestore();
+		}
 	});
 });
 

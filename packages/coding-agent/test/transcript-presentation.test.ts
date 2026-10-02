@@ -191,6 +191,46 @@ describe("transcript presentation", () => {
 		expect(presentation.document.render(80).join("\n")).toContain("new session user");
 	});
 
+	it("retains live counts through turns and reconciliation, but resets their interval on toggles and session changes", () => {
+		const presentation = new TranscriptPresentation({
+			header: new Text("header", 0, 0),
+			resources: new Text("resources", 0, 0),
+			transcript: pendingOutput("ordinary diagnostic details"),
+			pendingOutput: pendingOutput("pending"),
+			getMarkdownTheme,
+			getOutputPad: () => 1,
+			getMarkdownTransformers: () => [],
+		});
+		const historical = fauxAssistantMessage("historical failure", { stopReason: "error" });
+		presentation.replaceHistory([historical]);
+		presentation.reportDiagnostic("warning");
+		presentation.messageEnded(fauxAssistantMessage("ordinary failure", { stopReason: "aborted" }));
+		expect(presentation.getStatus()).toBeUndefined();
+		presentation.toggleFocus();
+		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
+		presentation.reportDiagnostic("warning");
+		const failed = fauxAssistantMessage("live failure", { stopReason: "error" });
+		presentation.messageEnded(failed);
+		presentation.messageStarted({ role: "user", content: "next turn", timestamp: 1 });
+		presentation.messageEnded(fauxAssistantMessage("next completed answer"));
+		expect(presentation.getStatus()).toBe("Focus W:1 E:1");
+		presentation.replaceHistory([historical, failed]);
+		presentation.refreshConversation();
+		presentation.refreshConversation();
+		expect(presentation.getStatus()).toBe("Focus W:1 E:1");
+		expect(presentation.document.render(80).join("\n")).not.toContain("failure");
+		presentation.toggleFocus();
+		expect(presentation.getStatus()).toBeUndefined();
+		expect(presentation.document.render(80).join("\n")).toContain("ordinary diagnostic details");
+		presentation.toggleFocus();
+		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
+		presentation.reportDiagnostic("error");
+		presentation.resetSession();
+		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
+		presentation.replaceHistory([historical]);
+		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
+	});
+
 	it("does not present a deferred answer as completed even if it has a stop reason", () => {
 		const presentation = new TranscriptPresentation({
 			header: new Text("header", 0, 0),

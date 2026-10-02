@@ -64,10 +64,16 @@ export class FooterComponent implements Component {
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
 	private sessionStats?: SessionStats;
+	private readonly getPresentationStatus: () => string | undefined;
 
-	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+	constructor(
+		session: AgentSession,
+		footerData: ReadonlyFooterDataProvider,
+		getPresentationStatus: () => string | undefined = () => undefined,
+	) {
 		this.session = session;
 		this.footerData = footerData;
+		this.getPresentationStatus = getPresentationStatus;
 	}
 
 	setSession(session: AgentSession): void {
@@ -288,13 +294,22 @@ export class FooterComponent implements Component {
 
 		// Add extension statuses on a single line, sorted by key alphabetically
 		const extensionStatuses = this.footerData.getExtensionStatuses();
-		if (extensionStatuses.size > 0) {
+		const presentationStatus = this.getPresentationStatus();
+		if (extensionStatuses.size > 0 || presentationStatus) {
 			const sortedStatuses = Array.from(extensionStatuses.entries())
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([, text]) => sanitizeStatusText(text));
 			const statusLine = sortedStatuses.join(" ");
-			// Truncate to terminal width with dim ellipsis for consistency with footer style
-			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+			if (presentationStatus) {
+				// Reserve the right side for native presentation status; extensions keep the left.
+				const right = truncateToWidth(theme.fg("dim", presentationStatus), width, "");
+				const rightWidth = visibleWidth(right);
+				const leftWidth = Math.max(0, width - rightWidth - 2);
+				const left = truncateToWidth(statusLine, leftWidth, theme.fg("dim", "..."));
+				lines.push(left + " ".repeat(Math.max(0, width - visibleWidth(left) - rightWidth)) + right);
+			} else {
+				lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+			}
 		}
 
 		return lines;

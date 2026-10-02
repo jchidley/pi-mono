@@ -673,7 +673,9 @@ export class InteractiveMode {
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
-		this.footer = new FooterComponent(this.session, this.footerDataProvider);
+		this.footer = new FooterComponent(this.session, this.footerDataProvider, () =>
+			this.transcriptPresentation.getStatus(),
+		);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerContainer = new Container();
 		this.footerContainer.addChild(this.footer);
@@ -3060,6 +3062,7 @@ export class InteractiveMode {
 	 * Show an extension error in the UI.
 	 */
 	private showExtensionError(extensionPath: string, error: string, stack?: string): void {
+		this.transcriptPresentation.reportDiagnostic("error");
 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
 		const errorText = new ThemedText(() => theme.fg("error", errorMsg), 1, 0);
 		this.chatContainer.addChild(errorText);
@@ -3772,6 +3775,7 @@ export class InteractiveMode {
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage, intent);
 					} else {
+						this.transcriptPresentation.reportDiagnostic("error");
 						this.chatContainer.addChild(new Spacer(1));
 						const errorMessage = event.errorMessage;
 						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
@@ -3850,6 +3854,7 @@ export class InteractiveMode {
 
 	/** Show a managed-tool status update in the chat. */
 	private showManagedToolStatus(status: ToolStatus): void {
+		if (status.type === "warning") this.transcriptPresentation.reportDiagnostic("warning");
 		if (!this.managedToolStatusStarted) {
 			this.chatContainer.addChild(new Spacer(1));
 			this.managedToolStatusStarted = true;
@@ -4233,6 +4238,7 @@ export class InteractiveMode {
 		}
 		if (droppedCount <= previousDroppedCount) return;
 
+		this.transcriptPresentation.reportDiagnostic("warning");
 		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
@@ -4718,6 +4724,7 @@ export class InteractiveMode {
 	}
 
 	showError(errorMessage: string, intent: TranscriptOutputIntent = "background"): void {
+		this.transcriptPresentation.reportDiagnostic("error");
 		const spacer = new Spacer(1);
 		const text = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
 		this.transcriptPresentation.addOutput(spacer, intent);
@@ -4726,6 +4733,7 @@ export class InteractiveMode {
 	}
 
 	showWarning(warningMessage: string, intent: TranscriptOutputIntent = "background"): void {
+		this.transcriptPresentation.reportDiagnostic("warning");
 		const spacer = new Spacer(1);
 		const text = new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0);
 		this.transcriptPresentation.addOutput(spacer, intent);

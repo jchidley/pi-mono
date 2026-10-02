@@ -689,6 +689,8 @@ describe("focus lifecycle", () => {
 			await test.mode.init();
 			submit(test.terminal, "/focus");
 			expect(await screen(test.terminal)).toContain("first rendering");
+			test.mode.showWarning("diagnostic before reload");
+			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
 			const records = structuredClone(test.initial.sessionManager.getEntries());
 			const context = structuredClone(test.initial.session.messages);
 			label = "reloaded rendering";
@@ -696,10 +698,12 @@ describe("focus lifecycle", () => {
 			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("reload finished"));
 			const output = await screen(test.terminal);
 			expect(output).toContain("reloaded rendering");
+			expect(output).toContain("Focus W:1 E:0");
 			expect(output).not.toContain("first rendering");
 			expect(output).not.toContain("ordinary reasoning");
 			test.mode.showWarning("reload ordinary warning");
 			expect(await screen(test.terminal)).not.toContain("reload ordinary warning");
+			expect(await screen(test.terminal)).toContain("Focus W:2 E:0");
 			expect(test.initial.sessionManager.getEntries()).toEqual(records);
 			expect(test.initial.session.messages).toEqual(context);
 			expect(test.initial.settingsManager.getHideThinkingBlock()).toBe(true);
@@ -837,14 +841,19 @@ describe("focus lifecycle", () => {
 			test.initial.session.refreshContext();
 			await test.mode.init();
 			submit(test.terminal, "/focus");
+			test.mode.showError("first session error");
+			expect(await screen(test.terminal)).toContain("Focus W:0 E:1");
 			await test.runtime.fork(forkId, { position: "at" });
 			let output = await screen(test.terminal);
+			expect(output).toContain("Focus W:0 E:0");
 			expect(output).toContain("first answer");
 			expect(output).not.toContain("later answer");
 			test.mode.showWarning("fork ordinary warning");
 			expect(await screen(test.terminal)).not.toContain("fork ordinary warning");
+			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
 			await test.runtime.newSession();
 			output = await screen(test.terminal);
+			expect(output).toContain("Focus W:0 E:0");
 			expect(output).not.toContain("first answer");
 			test.current().setResponses([fauxAssistantMessage("new session answer")]);
 			await test.runtime.session.prompt("new session user");
@@ -852,14 +861,22 @@ describe("focus lifecycle", () => {
 			const selected = SessionManager.create(test.current().tempDir, test.current().tempDir);
 			selected.appendMessage({ role: "user", content: "selected user", timestamp: 3 });
 			selected.appendMessage(fauxAssistantMessage("selected answer"));
+			selected.appendMessage(fauxAssistantMessage("selected historical failure", { stopReason: "error" }));
+			test.mode.showWarning("new session warning");
+			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
 			await test.runtime.switchSession(selected.getSessionFile()!);
 			output = await screen(test.terminal);
+			expect(output).toContain("Focus W:0 E:0");
+			expect(output).not.toContain("selected historical failure");
 			expect(output).toContain("selected answer");
 			expect(output).not.toContain("new session answer");
 			test.mode.showWarning("selected ordinary warning");
 			expect(await screen(test.terminal)).not.toContain("selected ordinary warning");
+			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
 			submit(test.terminal, "/focus");
 			expect(await screen(test.terminal)).toContain("selected ordinary warning");
+			expect(await screen(test.terminal)).toContain("selected historical failure");
+			expect(await screen(test.terminal)).not.toContain("Focus W:");
 		} finally {
 			test.cleanup();
 		}

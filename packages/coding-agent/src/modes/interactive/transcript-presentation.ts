@@ -37,6 +37,8 @@ export class TranscriptPresentation {
 	private readonly messageComponents = new Map<Component, AgentMessage>();
 	private readonly explicitOutput = new Set<Component>();
 	private focusEnabled = false;
+	private warnings = 0;
+	private errors = 0;
 
 	constructor(options: TranscriptPresentationOptions) {
 		this.options = options;
@@ -49,7 +51,20 @@ export class TranscriptPresentation {
 		this.pendingOutput = options.pendingOutput;
 	}
 
+	/** Counts describe live diagnostics since entering focus, not unread or historical messages. */
+	getStatus(): string | undefined {
+		return this.focusEnabled ? `Focus W:${this.warnings} E:${this.errors}` : undefined;
+	}
+
+	reportDiagnostic(severity: "warning" | "error"): void {
+		if (!this.focusEnabled) return;
+		if (severity === "warning") this.warnings++;
+		else this.errors++;
+	}
+
 	toggleFocus(): void {
+		this.warnings = 0;
+		this.errors = 0;
 		this.focusEnabled = !this.focusEnabled;
 		if (this.focusEnabled) this.refreshConversation();
 		this.document.clear();
@@ -109,6 +124,8 @@ export class TranscriptPresentation {
 
 	/** Session-local presentation state is discarded, but the process-local viewing preference survives. */
 	resetSession(): void {
+		this.warnings = 0;
+		this.errors = 0;
 		this.options.pendingOutput.clear();
 		this.messageComponents.clear();
 		this.explicitOutput.clear();
@@ -123,6 +140,10 @@ export class TranscriptPresentation {
 
 	/** Consume the completed event directly: listeners run before session persistence. */
 	messageEnded(message: AgentMessage): void {
+		if (message.role === "assistant") {
+			if (message.stopReason === "error" || message.stopReason === "aborted") this.reportDiagnostic("error");
+			else if (message.stopReason === "length") this.reportDiagnostic("warning");
+		}
 		if (message.role !== "assistant" && message.role !== "user") return;
 		if (!this.messages.includes(message)) this.messages.push(message);
 		this.refreshConversation();
