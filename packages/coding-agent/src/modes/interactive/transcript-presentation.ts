@@ -10,7 +10,7 @@ export interface TranscriptPresentationOptions {
 	readonly header: Component;
 	readonly resources: Component;
 	readonly transcript: Component;
-	readonly pendingOutput: Component;
+	readonly pendingOutput: Container;
 	readonly getMarkdownTheme: () => MarkdownTheme;
 	readonly getOutputPad: () => number;
 	readonly getMarkdownTransformers: () => readonly MarkdownTransformer[];
@@ -31,7 +31,7 @@ export class TranscriptPresentation {
 	private readonly focused = new Container();
 	private readonly conversation = new Container();
 	private readonly options: TranscriptPresentationOptions;
-	private messages: ConversationMessage[] = [];
+	private messages: AgentMessage[] = [];
 	private focusEnabled = false;
 
 	constructor(options: TranscriptPresentationOptions) {
@@ -54,21 +54,30 @@ export class TranscriptPresentation {
 
 	/** The caller supplies current branch, compaction-aware display history, not the archive. */
 	replaceHistory(messages: readonly AgentMessage[]): void {
-		this.messages = [];
-		this.conversation.clear();
-		for (const message of messages) this.appendConversation(message);
+		this.messages = [...messages];
+		this.refreshConversation();
+	}
+
+	/** Session-local presentation state is discarded, but the process-local viewing preference survives. */
+	resetSession(): void {
+		this.options.pendingOutput.clear();
+		this.replaceHistory([]);
 	}
 
 	messageStarted(message: AgentMessage): void {
-		if (message.role === "user") this.appendConversation(message);
+		if (message.role !== "user") return;
+		this.messages.push(message);
+		this.renderConversationMessage(message);
 	}
 
 	/** Consume the completed event directly: listeners run before session persistence. */
 	messageEnded(message: AgentMessage): void {
-		if (message.role === "assistant") this.appendConversation(message);
+		if (message.role !== "assistant" && message.role !== "user") return;
+		if (!this.messages.includes(message)) this.messages.push(message);
+		this.refreshConversation();
 	}
 
-	private appendConversation(message: AgentMessage): void {
+	private renderConversationMessage(message: AgentMessage): void {
 		let projected: ConversationMessage;
 		if (message.role === "user") {
 			const text =
@@ -98,13 +107,13 @@ export class TranscriptPresentation {
 		} else {
 			return;
 		}
-		this.messages.push(projected);
 		this.renderMessage(projected);
 	}
 
-	private refreshConversation(): void {
+	/** Refresh rendering inputs without rebuilding the ordinary live component graph. */
+	refreshConversation(): void {
 		this.conversation.clear();
-		for (const message of this.messages) this.renderMessage(message);
+		for (const message of this.messages) this.renderConversationMessage(message);
 	}
 
 	private renderMessage(message: ConversationMessage): void {

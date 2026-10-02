@@ -614,6 +614,10 @@ export class InteractiveMode {
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			this.resetExtensionUI();
+			this.transcriptPresentation.resetSession();
+			this.pendingBashComponents = [];
+			this.bashComponent = undefined;
+			this.entriesRenderedByBoundaryCompaction.clear();
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
@@ -674,7 +678,10 @@ export class InteractiveMode {
 		this.themeController = new InteractiveThemeController(this.ui, {
 			getSettingsManager: () => this.settingsManager,
 			showError: (message) => this.showError(message),
-			onChanged: () => this.updateEditorBorderColor(),
+			onChanged: () => {
+				this.transcriptPresentation.refreshConversation();
+				this.updateEditorBorderColor();
+			},
 			initialThemeSetting: options.initialThemeSetting,
 		});
 	}
@@ -1110,6 +1117,7 @@ export class InteractiveMode {
 
 		// Set up theme file watcher
 		onThemeChange(() => {
+			this.transcriptPresentation.refreshConversation();
 			this.ui.invalidate();
 			this.updateEditorBorderColor();
 			this.ui.requestRender();
@@ -2116,6 +2124,7 @@ export class InteractiveMode {
 			this.subscribeToAgent();
 		}
 
+		this.transcriptPresentation.refreshConversation();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -3473,6 +3482,7 @@ export class InteractiveMode {
 				} else if (event.entry.type === "compaction") {
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.id !== event.entry.id) break;
+					this.reconcilePresentedHistory(entries);
 					this.chatContainer.clear();
 					const branch = this.sessionManager.getBranch();
 					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
@@ -3663,6 +3673,7 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
+				this.reconcilePresentedHistory();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
@@ -3715,6 +3726,7 @@ export class InteractiveMode {
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
+					this.reconcilePresentedHistory(entries);
 					this.chatContainer.clear();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
 					this.renderSessionEntries(entries.slice(1));
@@ -4217,9 +4229,14 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `${label}: ${reBilled}`), 1, 0));
 	}
 
+	/** Match the ordinary display context, never the archive or a second model-context projection. */
+	private reconcilePresentedHistory(entries = this.sessionManager.buildContextEntries()): void {
+		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
+	}
+
 	renderInitialMessages(): void {
 		const entries = this.sessionManager.buildContextEntries();
-		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
+		this.reconcilePresentedHistory(entries);
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -4272,7 +4289,9 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		const entries = this.sessionManager.buildContextEntries();
+		this.reconcilePresentedHistory(entries);
+		this.renderSessionEntries(entries);
 	}
 
 	// =========================================================================
@@ -5071,6 +5090,7 @@ export class InteractiveMode {
 					},
 					onMermaidRenderingModeChange: (mode) => {
 						this.settingsManager.setMermaidRenderingMode(mode);
+						this.transcriptPresentation.refreshConversation();
 						this.chatContainer.invalidate();
 						this.ui.requestRender();
 					},
@@ -5110,6 +5130,7 @@ export class InteractiveMode {
 					onOutputPadChange: (padding) => {
 						this.settingsManager.setOutputPad(padding);
 						this.outputPad = padding;
+						this.transcriptPresentation.refreshConversation();
 						for (const container of [this.chatContainer, this.pendingMessagesContainer]) {
 							for (const child of container.children) {
 								if ("setOutputPad" in child && typeof child.setOutputPad === "function") {
@@ -6522,6 +6543,7 @@ export class InteractiveMode {
 			setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 			this.applyRuntimeSettings();
 			this.themeController.applyFromSettings();
+			this.transcriptPresentation.refreshConversation();
 			this.setupAutocompleteProvider();
 			const runner = this.session.extensionRunner;
 			this.setupExtensionShortcuts(runner);

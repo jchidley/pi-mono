@@ -39,6 +39,7 @@ type LoadedResourcesContext = {
 };
 
 type RebindContext = {
+	transcriptPresentation: { refreshConversation: () => void };
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
 	programStatus: { reset(): void };
@@ -51,6 +52,7 @@ type RebindContext = {
 };
 
 type ReloadCommandContext = {
+	transcriptPresentation: { refreshConversation: () => void };
 	hideThinkingBlock: boolean;
 	session: {
 		isStreaming: boolean;
@@ -120,6 +122,7 @@ type ReloadCommandContextOverrides = Omit<
 function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {}): ReloadCommandContext {
 	const editor = overrides.editor ?? {};
 	return {
+		transcriptPresentation: overrides.transcriptPresentation ?? { refreshConversation: () => {} },
 		hideThinkingBlock: overrides.hideThinkingBlock ?? false,
 		session: {
 			isStreaming: false,
@@ -252,6 +255,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => events.push("apply"),
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -294,6 +298,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -347,6 +352,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
