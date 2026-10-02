@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 
 type RebindContext = {
+	transcriptPresentation: { refreshConversation: () => void };
 	session: object;
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
@@ -38,6 +39,7 @@ describe("overlapping startup and replacement session rebinds", () => {
 		let bindCount = 0;
 
 		const context: RebindContext = {
+			transcriptPresentation: { refreshConversation: () => {} },
 			session: startupSession,
 			applyRuntimeSettings: () => {},
 			renderCurrentSessionState: () => {},
