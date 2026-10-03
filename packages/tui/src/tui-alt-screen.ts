@@ -319,6 +319,17 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.lastClick = undefined;
 	}
 
+	/** Clear positions and gestures belonging to a replaced transcript, preserving other overlays. */
+	resetDocumentInteractions(): void {
+		this.closeSearch();
+		this.resetTextSelection();
+		this.stopScrollbarHover();
+		this.stopScrollbarDrag();
+		this.clearComponentMouseGesture();
+		this.lastComponentClick = undefined;
+		this.requestRender();
+	}
+
 	/** The lines of the last rendered frame, one per terminal row, as written to the terminal. */
 	getScreenLines(): string[] {
 		return [...this.previousScreen];

@@ -71,6 +71,11 @@ export class TranscriptPresentation {
 		this.document.addChild(this.focusEnabled ? this.focused : this.ordinary);
 	}
 
+	/** Focus is a fullscreen-only viewing preference, never an exit/export policy. */
+	disableFocus(): void {
+		if (this.focusEnabled) this.toggleFocus();
+	}
+
 	/** The caller supplies current branch, compaction-aware display history, not the archive. */
 	replaceHistory(messages: readonly AgentMessage[]): void {
 		this.messages = [...messages];
