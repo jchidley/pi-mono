@@ -2,6 +2,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
+import type { ResourceDiagnostic } from "../../../src/core/resource-loader.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness, createTestUiContext } from "../harness.ts";
@@ -31,6 +32,7 @@ type LoadedResourcesContext = {
 			getRegisteredCommands: () => [];
 		};
 	};
+	getLoadedResourceDiagnostics: () => Array<{ label: string; diagnostics: ResourceDiagnostic[] }>;
 	getStartupExpansionState: () => boolean;
 	shouldShowStartupDetails: () => boolean;
 	formatDisplayPath: (resourcePath: string) => string;
@@ -95,6 +97,9 @@ type ReloadCommandContext = {
 };
 
 type InteractiveModePrototype = {
+	getLoadedResourceDiagnostics(
+		this: LoadedResourcesContext,
+	): Array<{ label: string; diagnostics: ResourceDiagnostic[] }>;
 	showLoadedResources(
 		this: LoadedResourcesContext,
 		options?: { extensions?: Array<{ path: string }>; force?: boolean; showDiagnosticsWhenQuiet?: boolean },
@@ -211,6 +216,7 @@ function createLoadedResourcesContext(): LoadedResourcesContext {
 				getRegisteredCommands: () => [],
 			},
 		},
+		getLoadedResourceDiagnostics: interactiveModePrototype.getLoadedResourceDiagnostics,
 		getStartupExpansionState: () => false,
 		shouldShowStartupDetails: () => true,
 		formatDisplayPath: (resourcePath) => resourcePath,

@@ -458,6 +458,7 @@ export class InteractiveMode {
 	private ui: TUI;
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
+	private loadedResourceDiagnostics = new Set<string>();
 	private chatContainer: Container;
 	private transcriptPresentation: TranscriptPresentation;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
@@ -1801,6 +1802,63 @@ export class InteractiveMode {
 		return lines.join("\n");
 	}
 
+	private getLoadedResourceDiagnostics(): Array<{ label: string; diagnostics: ResourceDiagnostic[] }> {
+		const extensions = this.session.resourceLoader.getExtensions();
+		const runner = this.session.extensionRunner;
+		return [
+			{ label: "Skill conflicts", diagnostics: this.session.resourceLoader.getSkills().diagnostics },
+			{ label: "Prompt conflicts", diagnostics: this.session.resourceLoader.getPrompts().diagnostics },
+			{
+				label: "Extension issues",
+				diagnostics: [
+					...extensions.errors.map(
+						(error): ResourceDiagnostic => ({
+							type: "error",
+							message: error.error,
+							path: error.path,
+						}),
+					),
+					...(extensions.warnings ?? []).map(
+						(warning): ResourceDiagnostic => ({
+							type: "warning",
+							message: warning.warning,
+							path: warning.path,
+						}),
+					),
+					...runner.getCommandDiagnostics(),
+					...this.getBuiltInCommandConflictDiagnostics(runner),
+					...runner.getShortcutDiagnostics(),
+				],
+			},
+			{ label: "Theme conflicts", diagnostics: this.session.resourceLoader.getThemes().diagnostics },
+		];
+	}
+
+	/** Loading establishes a baseline; unchanged reloads and rendering never replay diagnostics. */
+	private updateLoadedResourceDiagnostics(reportNew: boolean): void {
+		const current = new Set<string>();
+		for (const { label, diagnostics } of this.getLoadedResourceDiagnostics()) {
+			for (const diagnostic of diagnostics) {
+				const key = JSON.stringify([
+					label,
+					diagnostic.type,
+					diagnostic.path,
+					diagnostic.message,
+					diagnostic.collision?.resourceType,
+					diagnostic.collision?.name,
+					diagnostic.collision?.winnerPath,
+					diagnostic.collision?.loserPath,
+				]);
+				if (reportNew && !current.has(key) && !this.loadedResourceDiagnostics.has(key)) {
+					// Collisions are user-facing skipped-resource warnings, not execution failures.
+					this.transcriptPresentation.reportDiagnostic(diagnostic.type === "error" ? "error" : "warning");
+				}
+				current.add(key);
+			}
+		}
+		this.loadedResourceDiagnostics = current;
+	}
+
 	private showLoadedResources(options?: {
 		extensions?: Array<{ path: string; sourceInfo?: SourceInfo }>;
 		force?: boolean;
@@ -1944,53 +2002,11 @@ export class InteractiveMode {
 		}
 
 		if (showDiagnostics) {
-			const skillDiagnostics = skillsResult.diagnostics;
-			if (skillDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(skillDiagnostics, sourceInfos);
+			for (const { label, diagnostics } of this.getLoadedResourceDiagnostics()) {
+				if (diagnostics.length === 0) continue;
+				const warningLines = () => this.formatDiagnostics(diagnostics, sourceInfos);
 				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Skill conflicts]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
-
-			const promptDiagnostics = promptsResult.diagnostics;
-			if (promptDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(promptDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
-
-			const extensionDiagnostics: ResourceDiagnostic[] = [];
-			const extensionsResult = this.session.resourceLoader.getExtensions();
-			for (const error of extensionsResult.errors) {
-				extensionDiagnostics.push({ type: "error", message: error.error, path: error.path });
-			}
-			for (const warning of extensionsResult.warnings ?? []) {
-				extensionDiagnostics.push({ type: "warning", message: warning.warning, path: warning.path });
-			}
-
-			const commandDiagnostics = this.session.extensionRunner.getCommandDiagnostics();
-			extensionDiagnostics.push(...commandDiagnostics);
-			extensionDiagnostics.push(...this.getBuiltInCommandConflictDiagnostics(this.session.extensionRunner));
-
-			const shortcutDiagnostics = this.session.extensionRunner.getShortcutDiagnostics();
-			extensionDiagnostics.push(...shortcutDiagnostics);
-
-			if (extensionDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(extensionDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Extension issues]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
-
-			const themeDiagnostics = themesResult.diagnostics;
-			if (themeDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(themeDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Theme conflicts]")}\n${warningLines()}`, 0, 0),
+					new ThemedText(() => `${theme.fg("warning", `[${label}]`)}\n${warningLines()}`, 0, 0),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
@@ -2076,6 +2092,7 @@ export class InteractiveMode {
 
 		const extensionRunner = this.session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
+		this.updateLoadedResourceDiagnostics(false);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		this.showStartupNoticesIfNeeded();
 	}
@@ -3504,27 +3521,28 @@ export class InteractiveMode {
 					);
 					this.ui.requestRender();
 				} else if (event.entry.type === "compaction") {
+					const entry = event.entry;
 					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.id !== event.entry.id) break;
-					this.reconcilePresentedHistory(entries);
-					this.chatContainer.clear();
-					const branch = this.sessionManager.getBranch();
-					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
-					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
-					const retainedEntries = entries.slice(1);
-					this.renderSessionEntries(retainedEntries.filter((entry) => !entriesAfterCompaction.has(entry.id)));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(event.entry.summary, event.entry.tokensBefore, event.entry.timestamp),
-					);
-					if (event.entry.usage) {
-						this.addCompactionCostNotice({
-							type: "compaction_cost",
-							kind: "compaction",
-							usage: event.entry.usage,
-						});
-					}
-					this.renderSessionEntries(retainedEntries.filter((entry) => entriesAfterCompaction.has(entry.id)));
-					for (const entryId of entriesAfterCompaction) this.entriesRenderedByBoundaryCompaction.add(entryId);
+					if (entries[0]?.id !== entry.id) break;
+					this.rebuildChatFromMessages(entries, () => {
+						const branch = this.sessionManager.getBranch();
+						const compactionIndex = branch.findIndex((candidate) => candidate.id === entry.id);
+						const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
+						const retainedEntries = entries.slice(1);
+						this.renderSessionEntries(retainedEntries.filter((entry) => !entriesAfterCompaction.has(entry.id)));
+						this.addMessageToChat(
+							createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
+						);
+						if (entry.usage) {
+							this.addCompactionCostNotice({
+								type: "compaction_cost",
+								kind: "compaction",
+								usage: entry.usage,
+							});
+						}
+						this.renderSessionEntries(retainedEntries.filter((entry) => entriesAfterCompaction.has(entry.id)));
+						for (const entryId of entriesAfterCompaction) this.entriesRenderedByBoundaryCompaction.add(entryId);
+					});
 					this.footer.invalidate();
 					this.ui.requestRender();
 				}
@@ -3751,32 +3769,29 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
+					const result = event.result;
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
-					this.reconcilePresentedHistory(entries);
-					this.chatContainer.clear();
-					// The latest compaction is prepended for model context; append it below at its chronological position.
-					this.renderSessionEntries(entries.slice(1));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-						{ intent },
-					);
-					if (event.result.usage) {
-						this.addCompactionCostNotice(
-							{
-								type: "compaction_cost",
-								kind: "compaction",
-								usage: event.result.usage,
-							},
-							intent,
+					this.rebuildChatFromMessages(entries, () => {
+						// The latest compaction is prepended for model context; append it below at its chronological position.
+						this.renderSessionEntries(entries.slice(1));
+						this.addMessageToChat(
+							createCompactionSummaryMessage(result.summary, result.tokensBefore, new Date().toISOString()),
+							{ intent },
 						);
-					}
+						if (result.usage) {
+							this.addCompactionCostNotice(
+								{
+									type: "compaction_cost",
+									kind: "compaction",
+									usage: result.usage,
+								},
+								intent,
+							);
+						}
+					});
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -4344,12 +4359,14 @@ export class InteractiveMode {
 		});
 	}
 
-	private rebuildChatFromMessages(): void {
+	private rebuildChatFromMessages(
+		entries = this.sessionManager.buildContextEntries(),
+		render: () => void = () => this.renderSessionEntries(entries),
+	): void {
 		this.transcriptPresentation.rebuildPreservingExplicitOutput(this.bashComponent, () => {
 			this.chatContainer.clear();
-			const entries = this.sessionManager.buildContextEntries();
 			this.reconcilePresentedHistory(entries);
-			this.renderSessionEntries(entries);
+			render();
 		});
 	}
 
@@ -6653,6 +6670,7 @@ export class InteractiveMode {
 			this.setupAutocompleteProvider();
 			const runner = this.session.extensionRunner;
 			this.setupExtensionShortcuts(runner);
+			this.updateLoadedResourceDiagnostics(true);
 			this.showLoadedResources({
 				force: false,
 				showDiagnosticsWhenQuiet: true,
