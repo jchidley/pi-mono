@@ -1,0 +1,744 @@
+From cbaba6512ed73225f847e5b7d2e101981775fb46 Mon Sep 17 00:00:00 2001
+From: Jack Chidley <7399749+jchidley@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 17:25:19 +0100
+Subject: [PATCH 2/6] feat(coding-agent): add live fullscreen focus toggle
+
+---
+ packages/coding-agent/src/core/keybindings.ts |   5 +
+ .../coding-agent/src/core/slash-commands.ts   |   1 +
+ .../src/modes/interactive/interactive-mode.ts |  31 ++
+ .../interactive/transcript-presentation.ts    | 118 +++++++-
+ .../test/interactive-mode-focus.test.ts       | 286 ++++++++++++++++++
+ .../test/transcript-presentation.test.ts      | 136 ++++++++-
+ 6 files changed, 564 insertions(+), 13 deletions(-)
+ create mode 100644 packages/coding-agent/test/interactive-mode-focus.test.ts
+
+diff --git a/packages/coding-agent/src/core/keybindings.ts b/packages/coding-agent/src/core/keybindings.ts
+index f67cbe5e3..cbf9baaf1 100644
+--- a/packages/coding-agent/src/core/keybindings.ts
++++ b/packages/coding-agent/src/core/keybindings.ts
+@@ -23,6 +23,7 @@ export interface AppKeybindings {
+ 	"app.model.select": true;
+ 	"app.tools.expand": true;
+ 	"app.thinking.toggle": true;
++	"app.transcript.toggleFinalOnly": true;
+ 	"app.session.toggleNamedFilter": true;
+ 	"app.editor.external": true;
+ 	"app.message.copy": true;
+@@ -119,6 +120,10 @@ export const KEYBINDINGS = {
+ 		defaultKeys: "ctrl+t",
+ 		description: "Toggle thinking blocks",
+ 	},
++	"app.transcript.toggleFinalOnly": {
++		defaultKeys: [],
++		description: "Toggle fullscreen focus",
++	},
+ 	"app.session.toggleNamedFilter": {
+ 		defaultKeys: "ctrl+n",
+ 		description: "Toggle named session filter",
+diff --git a/packages/coding-agent/src/core/slash-commands.ts b/packages/coding-agent/src/core/slash-commands.ts
+index 934de40a6..0fd93f2e4 100644
+--- a/packages/coding-agent/src/core/slash-commands.ts
++++ b/packages/coding-agent/src/core/slash-commands.ts
+@@ -27,6 +27,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+ 	{ name: "share", description: "Share session as a secret GitHub gist" },
+ 	{ name: "bug", description: "Report a bug to the Pi developers", argumentHint: "<description>" },
+ 	{ name: "copy", description: "Copy last agent message to clipboard" },
++	{ name: "focus", description: "Toggle fullscreen focus (user/completed answers)" },
+ 	{ name: "name", description: "Set session display name" },
+ 	{ name: "session", description: "Show session info and stats" },
+ 	{ name: "changelog", description: "Show changelog entries" },
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 32106e6e4..db8c3186e 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -629,6 +629,9 @@ export class InteractiveMode {
+ 			resources: this.loadedResourcesContainer,
+ 			transcript: this.chatContainer,
+ 			pendingOutput: this.pendingMessagesContainer,
++			getMarkdownTheme: () => this.getMarkdownThemeWithSettings(),
++			getOutputPad: () => this.outputPad,
++			getMarkdownTransformers: () => this.getMarkdownTransformers(),
+ 		});
+ 		this.statusContainer = new Container();
+ 		this.widgetContainerAbove = new Container();
+@@ -3052,6 +3055,7 @@ export class InteractiveMode {
+ 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+ 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
+ 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
++		this.defaultEditor.onAction("app.transcript.toggleFinalOnly", () => this.toggleFocus());
+ 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
+ 		this.defaultEditor.onAction(
+ 			"app.message.copy",
+@@ -3145,6 +3149,9 @@ export class InteractiveMode {
+ 			text = text.trim();
+ 			if (!text) return;
+ 
++			// Local presentation commands run before every execution/queuing path.
++			if (this.handleFocusCommand(text)) return;
++
+ 			// Handle commands
+ 			if (text === "/settings") {
+ 				this.showSettingsSelector();
+@@ -3441,6 +3448,7 @@ export class InteractiveMode {
+ 				break;
+ 
+ 			case "message_start":
++				this.transcriptPresentation.messageStarted(event.message);
+ 				if (event.message.role === "custom") {
+ 					this.addMessageToChat(event.message);
+ 					this.ui.requestRender();
+@@ -3500,6 +3508,7 @@ export class InteractiveMode {
+ 				break;
+ 
+ 			case "message_end":
++				this.transcriptPresentation.messageEnded(event.message);
+ 				if (event.message.role === "user") break;
+ 				if (this.streamingComponent && event.message.role === "assistant") {
+ 					this.streamingMessage = event.message;
+@@ -4130,6 +4139,7 @@ export class InteractiveMode {
+ 
+ 	renderInitialMessages(): void {
+ 		const entries = this.sessionManager.buildContextEntries();
++		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
+ 		this.renderSessionEntries(entries, {
+ 			updateFooter: true,
+ 			populateHistory: true,
+@@ -4391,6 +4401,7 @@ export class InteractiveMode {
+ 	private async handleFollowUp(): Promise<void> {
+ 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
+ 		if (!text) return;
++		if (this.handleFocusCommand(text)) return;
+ 
+ 		// Queue input during compaction (extension commands execute immediately)
+ 		if (this.session.isCompacting) {
+@@ -4470,6 +4481,24 @@ export class InteractiveMode {
+ 		}
+ 	}
+ 
++	private handleFocusCommand(text: string): boolean {
++		if (text !== "/focus") return false;
++		this.toggleFocus();
++		this.editor.setText("");
++		return true;
++	}
++
++	private toggleFocus(): void {
++		if (this.renderer.mode !== "fullscreen") {
++			this.showStatus("Focus requires fullscreen mode. Enable it in /settings.");
++			return;
++		}
++		this.transcriptPresentation.toggleFocus();
++		this.transcriptScrollView?.scrollToEnd();
++		this.ui.invalidate();
++		this.ui.requestRender();
++	}
++
+ 	private toggleToolOutputExpansion(): void {
+ 		this.setToolsExpanded(!this.toolOutputExpanded);
+ 	}
+@@ -6765,6 +6794,7 @@ export class InteractiveMode {
+ 		const selectModel = this.getAppKeyDisplay("app.model.select");
+ 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
+ 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
++		const toggleFocus = this.getAppKeyDisplay("app.transcript.toggleFinalOnly");
+ 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
+ 		const cycleModelBackward = this.getAppKeyDisplay("app.model.cycleBackward");
+ 		const copyMessage = this.getAppKeyDisplay("app.message.copy");
+@@ -6810,6 +6840,7 @@ export class InteractiveMode {
+ | \`${selectModel}\` | Open model selector |
+ | \`${expandTools}\` | Toggle tool output expansion |
+ | \`${toggleThinking}\` | Toggle thinking block visibility |
++| \`${toggleFocus}\` | Toggle fullscreen focus |
+ | \`${externalEditor}\` | Edit message in external editor |
+ | \`${copyMessage}\` | Copy selection or last assistant message |
+ | \`${followUp}\` | Queue follow-up message |
+diff --git a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+index a0b92b315..2acfc0fd5 100644
+--- a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
++++ b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+@@ -1,28 +1,124 @@
+-import { type Component, Container } from "@earendil-works/pi-tui";
++import type { AgentMessage } from "@earendil-works/pi-agent-core";
++import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai/compat";
++import { type Component, Container, type MarkdownTheme, Spacer } from "@earendil-works/pi-tui";
++import { parseSkillBlock } from "../../core/agent-session.ts";
++import type { MarkdownTransformer } from "../../core/extensions/types.ts";
++import { AssistantMessageComponent } from "./components/assistant-message.ts";
++import { UserMessageComponent } from "./components/user-message.ts";
+ 
+ export interface TranscriptPresentationOptions {
+ 	readonly header: Component;
+ 	readonly resources: Component;
+ 	readonly transcript: Component;
+ 	readonly pendingOutput: Component;
++	readonly getMarkdownTheme: () => MarkdownTheme;
++	readonly getOutputPad: () => number;
++	readonly getMarkdownTransformers: () => readonly MarkdownTransformer[];
+ }
+ 
++type ConversationMessage = (UserMessage & { content: string }) | AssistantMessage;
++
+ /**
+- * Owns transcript document composition, independently of the renderer and input dock.
+- * The host supplies the ordinary live component graph and keeps updating it through
+- * session events and native commands. Mount these surfaces in either native renderer;
+- * do not reconstruct messages or mix the pending dock into the scrollable document.
++ * Owns document selection and the text-only conversation projection. The host mounts
++ * these stable surfaces, seeds current display history, and delivers live message
++ * boundaries. Ordinary components continue receiving all updates while hidden.
++ * Execution, persistence, fullscreen interactions and the pending dock belong to the host.
+  */
+ export class TranscriptPresentation {
+-	readonly document: Component;
++	readonly document = new Container();
+ 	readonly pendingOutput: Component;
++	private readonly ordinary = new Container();
++	private readonly focused = new Container();
++	private readonly conversation = new Container();
++	private readonly options: TranscriptPresentationOptions;
++	private messages: ConversationMessage[] = [];
++	private focusEnabled = false;
+ 
+ 	constructor(options: TranscriptPresentationOptions) {
+-		const document = new Container();
+-		document.addChild(options.header);
+-		document.addChild(options.resources);
+-		document.addChild(options.transcript);
+-		this.document = document;
++		this.options = options;
++		this.ordinary.addChild(options.header);
++		this.ordinary.addChild(options.resources);
++		this.ordinary.addChild(options.transcript);
++		this.focused.addChild(options.header);
++		this.focused.addChild(this.conversation);
++		this.document.addChild(this.ordinary);
+ 		this.pendingOutput = options.pendingOutput;
+ 	}
++
++	toggleFocus(): void {
++		this.focusEnabled = !this.focusEnabled;
++		if (this.focusEnabled) this.refreshConversation();
++		this.document.clear();
++		this.document.addChild(this.focusEnabled ? this.focused : this.ordinary);
++	}
++
++	/** The caller supplies current branch, compaction-aware display history, not the archive. */
++	replaceHistory(messages: readonly AgentMessage[]): void {
++		this.messages = [];
++		this.conversation.clear();
++		for (const message of messages) this.appendConversation(message);
++	}
++
++	messageStarted(message: AgentMessage): void {
++		if (message.role === "user") this.appendConversation(message);
++	}
++
++	/** Consume the completed event directly: listeners run before session persistence. */
++	messageEnded(message: AgentMessage): void {
++		if (message.role === "assistant") this.appendConversation(message);
++	}
++
++	private appendConversation(message: AgentMessage): void {
++		let projected: ConversationMessage;
++		if (message.role === "user") {
++			const text =
++				typeof message.content === "string"
++					? message.content
++					: message.content
++							.filter((block) => block.type === "text")
++							.map((block) => block.text)
++							.join("");
++			const skill = parseSkillBlock(text);
++			// CLI @file attachments use this envelope. Omit their bodies, not the user's surrounding text.
++			const userText = (skill ? (skill.userMessage ?? `/skill:${skill.name}`) : text).replace(
++				/<file name="[^"]*">[\s\S]*?<\/file>\n?/g,
++				"",
++			);
++			if (!userText.trim()) return;
++			projected = { ...message, content: userText };
++		} else if (
++			message.role === "assistant" &&
++			message.stopReason === "stop" &&
++			!message.deferred &&
++			!message.content.some((block) => block.type === "toolCall")
++		) {
++			const content = message.content.filter((block) => block.type === "text").map((block) => ({ ...block }));
++			if (!content.some((block) => block.text.trim())) return;
++			projected = { ...message, content };
++		} else {
++			return;
++		}
++		this.messages.push(projected);
++		this.renderMessage(projected);
++	}
++
++	private refreshConversation(): void {
++		this.conversation.clear();
++		for (const message of this.messages) this.renderMessage(message);
++	}
++
++	private renderMessage(message: ConversationMessage): void {
++		const markdownTheme = this.options.getMarkdownTheme();
++		const outputPad = this.options.getOutputPad();
++		const transformers = this.options.getMarkdownTransformers();
++		if (message.role === "user") {
++			if (this.conversation.children.length > 0) this.conversation.addChild(new Spacer(1));
++			// User projections contain only their text, never media or expanded skill bodies.
++			this.conversation.addChild(new UserMessageComponent(message.content, markdownTheme, outputPad, transformers));
++		} else {
++			this.conversation.addChild(
++				new AssistantMessageComponent(message, false, markdownTheme, undefined, outputPad, transformers),
++			);
++		}
++	}
+ }
+diff --git a/packages/coding-agent/test/interactive-mode-focus.test.ts b/packages/coding-agent/test/interactive-mode-focus.test.ts
+new file mode 100644
+index 000000000..9eefa0550
+--- /dev/null
++++ b/packages/coding-agent/test/interactive-mode-focus.test.ts
+@@ -0,0 +1,286 @@
++import { writeFileSync } from "node:fs";
++import { join } from "node:path";
++import type { AgentTool } from "@earendil-works/pi-agent-core";
++import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
++import { Text } from "@earendil-works/pi-tui";
++import { Type } from "typebox";
++import { describe, expect, it, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import { KEYBINDINGS, KeybindingsManager } from "../src/core/keybindings.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { createHarness, type Harness } from "./suite/harness.ts";
++
++function createMode(harness: Harness, terminal: VirtualTerminal, tuiMode: "fullscreen" | "regular") {
++	const runtime = new AgentSessionRuntime(
++		harness.session,
++		{
++			cwd: harness.tempDir,
++			agentDir: harness.tempDir,
++			modelRuntime: harness.session.modelRuntime,
++			settingsManager: harness.settingsManager,
++			resourceLoader: harness.session.resourceLoader,
++			diagnostics: [],
++		},
++		async () => {
++			throw new Error("Session replacement is outside Ticket 02");
++		},
++	);
++	return new InteractiveMode(runtime, { tuiMode, terminal });
++}
++
++function submit(terminal: VirtualTerminal, text: string) {
++	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
++	terminal.sendInput("\r");
++}
++
++async function screen(terminal: VirtualTerminal) {
++	await terminal.waitForRender();
++	return terminal.getViewport().join("\n");
++}
++
++describe("live fullscreen focus", () => {
++	it("leaves the focus action unbound and editor defaults unchanged", () => {
++		const keys = new KeybindingsManager();
++		expect(keys.getKeys("app.transcript.toggleFinalOnly")).toEqual([]);
++		expect(KEYBINDINGS["app.transcript.toggleFinalOnly"].defaultKeys).toEqual([]);
++		expect(keys.getKeys("tui.editor.yank")).toContain("ctrl+y");
++	});
++
++	it.each(["regular", "fullscreen"] as const)(
++		"dispatches locally in %s without submitting pending editor input",
++		async (tuiMode) => {
++			const harness = await createHarness({ settings: { theme: "dark", showCacheMissNotices: false } });
++			writeFileSync(
++				join(harness.tempDir, "keybindings.json"),
++				JSON.stringify({ "app.transcript.toggleFinalOnly": ["f6"] }),
++			);
++			vi.stubEnv("PI_CODING_AGENT_DIR", harness.tempDir);
++			const terminal = new VirtualTerminal(120, 50);
++			const mode = createMode(harness, terminal, tuiMode);
++			try {
++				harness.sessionManager.appendMessage({ role: "user", content: "restored user", timestamp: 1 });
++				harness.sessionManager.appendMessage(fauxAssistantMessage("restored answer"));
++				harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
++				const records = structuredClone(harness.sessionManager.getEntries());
++				await mode.init();
++				mode.showWarning("ordinary diagnostic");
++				submit(terminal, "/focus");
++				let output = await screen(terminal);
++				expect(output).toContain("restored user");
++				expect(output).toContain("restored answer");
++				if (tuiMode === "fullscreen") expect(output).not.toContain("ordinary diagnostic");
++				else expect(output).toContain("Focus requires fullscreen");
++				terminal.sendInput("\x1b[200~pending editor input\x1b[201~");
++				terminal.sendInput("\x1b[17~"); // Configured F6, not a built-in default.
++				output = await screen(terminal);
++				expect(output).toContain("ordinary diagnostic");
++				expect(output).toContain("pending editor input");
++				expect(harness.faux.state.callCount).toBe(0);
++				expect(harness.session.messages).toHaveLength(2);
++				expect(harness.sessionManager.getEntries()).toEqual(records);
++				expect(harness.session.pendingMessageCount).toBe(0);
++				// getUserInput must still wait: neither command nor shortcut submitted a prompt.
++				let submitted = false;
++				void mode.getUserInput().then(() => {
++					submitted = true;
++				});
++				await Promise.resolve();
++				expect(submitted).toBe(false);
++			} finally {
++				mode.stop("resume-hint");
++				harness.cleanup();
++				vi.unstubAllEnvs();
++			}
++		},
++	);
++
++	it("starts from the selected branch and retained post-compaction display history", async () => {
++		const harness = await createHarness({ settings: { theme: "dark", showCacheMissNotices: false } });
++		const terminal = new VirtualTerminal(120, 60);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			harness.sessionManager.appendMessage({ role: "user", content: "archived user", timestamp: 1 });
++			harness.sessionManager.appendMessage(fauxAssistantMessage("archived answer"));
++			const kept = harness.sessionManager.appendMessage({ role: "user", content: "retained user", timestamp: 2 });
++			harness.sessionManager.appendMessage(fauxAssistantMessage("retained answer"));
++			const compacted = harness.sessionManager.appendCompaction("compaction summary", kept, 1000);
++			harness.sessionManager.appendMessage(fauxAssistantMessage("unselected branch answer"));
++			harness.sessionManager.branch(compacted);
++			harness.sessionManager.appendMessage({ role: "user", content: "selected user", timestamp: 3 });
++			harness.sessionManager.appendMessage(fauxAssistantMessage("selected answer"));
++			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
++			const records = structuredClone(harness.sessionManager.getEntries());
++			await mode.init();
++			submit(terminal, "/focus");
++			const output = await screen(terminal);
++			for (const text of ["retained user", "retained answer", "selected user", "selected answer"])
++				expect(output).toContain(text);
++			for (const text of [
++				"archived user",
++				"archived answer",
++				"unselected branch answer",
++				"compaction summary",
++				"Session compacted",
++			])
++				expect(output).not.toContain(text);
++			expect(harness.sessionManager.getEntries()).toEqual(records);
++			expect(harness.faux.state.callCount).toBe(0);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
++	it("toggles during assistant streaming and tools, exposing latest ordinary output and one final answer before persistence", async () => {
++		let releaseTool = () => {};
++		let toolStarted = () => {};
++		const started = new Promise<void>((resolve) => {
++			toolStarted = resolve;
++		});
++		const held = new Promise<void>((resolve) => {
++			releaseTool = resolve;
++		});
++		const tool: AgentTool = {
++			name: "echo",
++			label: "Echo",
++			description: "Offline echo",
++			parameters: Type.Object({}),
++			execute: async (_id, _args, _signal, onUpdate) => {
++				onUpdate?.({ content: [{ type: "text", text: "tool partial" }], details: {} });
++				toolStarted();
++				await held;
++				return { content: [{ type: "text", text: "tool finished" }], details: {} };
++			},
++		};
++		const harness = await createHarness({
++			tools: [tool],
++			fauxStreaming: { tokensPerSecond: 100, tokenSize: { min: 1, max: 1 } },
++			settings: { theme: "dark", showCacheMissNotices: false },
++			extensionFactories: [
++				(pi) => {
++					pi.on("message_end", (event) => {
++						if (event.message.role === "assistant" && event.message.stopReason === "stop") {
++							return {
++								message: {
++									...event.message,
++									content: [
++										{ type: "thinking", thinking: "extension reasoning" },
++										{ type: "text", text: "final focused answer" },
++									],
++								},
++							};
++						}
++					});
++					pi.on("session_start", (_event, ctx) => {
++						ctx.ui.setHeader(() => new Text("focus header", 0, 0));
++						ctx.ui.setWidget("widget", ["focus widget"]);
++						ctx.ui.setStatus("test", "focus status");
++					});
++				},
++			],
++		});
++		writeFileSync(
++			join(harness.tempDir, "keybindings.json"),
++			JSON.stringify({ "app.transcript.toggleFinalOnly": ["f6"], "app.message.followUp": ["f7"] }),
++		);
++		vi.stubEnv("PI_CODING_AGENT_DIR", harness.tempDir);
++		const terminal = new VirtualTerminal(120, 60);
++		const mode = createMode(harness, terminal, "fullscreen");
++		let unsubscribe = () => {};
++		let prompt: Promise<void> | undefined;
++		try {
++			await mode.init();
++			mode.showWarning("hidden notice");
++			submit(terminal, "/focus");
++			expect(await screen(terminal)).not.toContain("hidden notice");
++			let sawPartial = false;
++			let completedBeforePersistence = false;
++			unsubscribe = harness.session.subscribe((event) => {
++				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta" && !sawPartial) {
++					sawPartial = true;
++					// Native input dispatch is synchronous: toggle out while the response is unfinished.
++					submit(terminal, "/focus");
++					terminal.sendInput("\x1b[200~still pending\x1b[201~");
++				}
++				if (
++					event.type === "message_end" &&
++					event.message.role === "assistant" &&
++					event.message.stopReason === "stop"
++				) {
++					completedBeforePersistence = !harness.sessionManager
++						.getBranch()
++						.some((entry) => entry.type === "message" && entry.message === event.message);
++					// No later history rebuild occurs: the next frame must contain this event's answer.
++				}
++			});
++			harness.setResponses([
++				fauxAssistantMessage(
++					[
++						{ type: "thinking", thinking: "private reasoning" },
++						{ type: "text", text: "assistant tool commentary grows while running" },
++						fauxToolCall("echo", {}),
++					],
++					{ stopReason: "toolUse" },
++				),
++				fauxAssistantMessage([
++					{ type: "thinking", thinking: "final private reasoning" },
++					{ type: "text", text: "untransformed provider answer" },
++				]),
++			]);
++			prompt = harness.session.prompt("live user text");
++			await started;
++			let output = await screen(terminal);
++			expect(sawPartial).toBe(true);
++			expect(output).toContain("assistant tool commentary grows while running");
++			expect(output).toContain("tool partial");
++			expect(output).toContain("still pending");
++			// Delete the draft without invoking interrupt or the double-Ctrl+C exit action.
++			terminal.sendInput("\x15");
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output).toContain("live user text");
++			expect(output).not.toContain("tool partial");
++			expect(output).not.toContain("assistant tool commentary");
++			expect(output).not.toContain("private reasoning");
++			expect(output).not.toContain("Thinking...");
++			for (const text of ["focus header", "focus widget", "focus status", "Working"]) expect(output).toContain(text);
++			expect(harness.session.isStreaming).toBe(true);
++			expect(harness.session.pendingMessageCount).toBe(0);
++			terminal.sendInput("\x1b[200~pending tool input\x1b[201~");
++			terminal.sendInput("\x1b[17~");
++			output = await screen(terminal);
++			expect(output).toContain("tool partial");
++			expect(output).toContain("pending tool input");
++			terminal.sendInput("\x1b[17~");
++			expect(await screen(terminal)).not.toContain("tool partial");
++			expect(harness.session.pendingMessageCount).toBe(0);
++			terminal.sendInput("\x15");
++			terminal.sendInput("\x1b[200~/focus\x1b[201~");
++			terminal.sendInput("\x1b[18~"); // Follow-up submission must still dispatch this local command.
++			expect(await screen(terminal)).toContain("tool partial");
++			expect(harness.session.pendingMessageCount).toBe(0);
++			submit(terminal, "/focus");
++			releaseTool();
++			await prompt;
++			expect(completedBeforePersistence).toBe(true);
++			expect(await screen(terminal)).toContain("final focused answer");
++			terminal.sendInput("\x15");
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output).toContain("tool finished");
++			expect(output).toContain("hidden notice");
++			submit(terminal, "/focus");
++			expect((await screen(terminal)).match(/final focused answer/g)).toHaveLength(1);
++			expect(harness.faux.state.callCount).toBe(2);
++			expect(harness.session.messages.filter((message) => message.role === "user")).toHaveLength(1);
++		} finally {
++			releaseTool();
++			await prompt;
++			unsubscribe();
++			mode.stop("resume-hint");
++			harness.cleanup();
++			vi.unstubAllEnvs();
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/transcript-presentation.test.ts b/packages/coding-agent/test/transcript-presentation.test.ts
+index 0c43e0c99..19f079695 100644
+--- a/packages/coding-agent/test/transcript-presentation.test.ts
++++ b/packages/coding-agent/test/transcript-presentation.test.ts
+@@ -1,8 +1,137 @@
++import type { AgentMessage } from "@earendil-works/pi-agent-core";
++import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
+ import { Container, Text } from "@earendil-works/pi-tui";
+-import { describe, expect, it } from "vitest";
++import { beforeEach, describe, expect, it } from "vitest";
++import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
+ import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
+ 
+-describe("ordinary transcript presentation", () => {
++describe("transcript presentation", () => {
++	beforeEach(() => initTheme("dark"));
++	it("switches to user text and completed answers while ordinary live output keeps growing", () => {
++		const transcript = new Container();
++		const partial = new Text("partial answer", 0, 0);
++		transcript.addChild(partial);
++		const presentation = new TranscriptPresentation({
++			header: new Text("header", 0, 0),
++			resources: new Text("loaded resources", 0, 0),
++			transcript,
++			pendingOutput: new Text("queued input", 0, 0),
++			getMarkdownTheme,
++			getOutputPad: () => 1,
++			getMarkdownTransformers: () => [],
++		});
++		presentation.replaceHistory([{ role: "user", content: "hello focus", timestamp: 1 }]);
++		presentation.toggleFocus();
++		const visible = () => presentation.document.render(80).join("\n");
++		expect(visible()).toContain("hello focus");
++		expect(visible()).not.toContain("partial answer");
++		expect(visible()).not.toContain("loaded resources");
++		partial.setText("latest partial answer");
++		transcript.addChild(new Text("latest tool output", 0, 0));
++		presentation.messageEnded(fauxAssistantMessage("completed answer"));
++		expect(visible()).toContain("completed answer");
++		presentation.toggleFocus();
++		expect(visible()).toContain("latest partial answer");
++		expect(visible()).toContain("latest tool output");
++		presentation.toggleFocus();
++		expect(visible().match(/completed answer/g)).toHaveLength(1);
++		expect(presentation.pendingOutput.render(80).join("\n")).toContain("queued input");
++	});
++	it("projects only user text and successful tool-free answers without mutating history", () => {
++		const presentation = new TranscriptPresentation({
++			header: new Text("header", 0, 0),
++			resources: new Text("resources", 0, 0),
++			transcript: new Text("ordinary", 0, 0),
++			pendingOutput: new Text("pending", 0, 0),
++			getMarkdownTheme,
++			getOutputPad: () => 1,
++			getMarkdownTransformers: () => [],
++		});
++		const history: AgentMessage[] = [
++			{
++				role: "user",
++				content: [
++					{ type: "text", text: "user words" },
++					{ type: "image", data: "image bytes", mimeType: "image/png" },
++				],
++				timestamp: 1,
++			},
++			{
++				role: "user",
++				content: '<skill name="example" location="/tmp/SKILL.md">\nexpanded skill body\n</skill>\n\nmy own request',
++				timestamp: 2,
++			},
++			{
++				role: "user",
++				content: 'inspect this\n<file name="/tmp/attached.txt">attachment body</file>\nplease',
++				timestamp: 3,
++			},
++			fauxAssistantMessage([
++				{ type: "thinking", thinking: "secret reasoning" },
++				{ type: "text", text: "successful answer" },
++			]),
++			...(["length", "error", "aborted", "toolUse"] as const).map((stopReason) =>
++				fauxAssistantMessage(`excluded ${stopReason}`, { stopReason }),
++			),
++			fauxAssistantMessage([{ type: "text", text: "tool-bearing stop" }, fauxToolCall("echo", {})], {
++				stopReason: "stop",
++			}),
++			{ role: "custom", customType: "background", content: "unsolicited custom", display: true, timestamp: 4 },
++			{ role: "compactionSummary", summary: "hidden summary", tokensBefore: 100, timestamp: 5 },
++			{
++				role: "bashExecution",
++				command: "echo",
++				output: "deferred output",
++				exitCode: 0,
++				cancelled: false,
++				truncated: false,
++				timestamp: 6,
++			},
++		];
++		const original = structuredClone(history);
++		presentation.replaceHistory(history);
++		presentation.messageStarted(fauxAssistantMessage("streaming text"));
++		presentation.messageStarted({ role: "user", content: "live user", timestamp: 7 });
++		presentation.toggleFocus();
++		const output = presentation.document.render(100).join("\n");
++		for (const text of ["user words", "my own request", "inspect this", "please", "successful answer", "live user"])
++			expect(output).toContain(text);
++		for (const text of [
++			"image bytes",
++			"expanded skill body",
++			"attachment body",
++			"secret reasoning",
++			"Thinking",
++			"excluded",
++			"tool-bearing stop",
++			"unsolicited custom",
++			"hidden summary",
++			"deferred output",
++			"streaming text",
++		])
++			expect(output).not.toContain(text);
++		expect(history).toEqual(original);
++	});
++
++	it("does not present a deferred answer as completed even if it has a stop reason", () => {
++		const presentation = new TranscriptPresentation({
++			header: new Text("header", 0, 0),
++			resources: new Text("resources", 0, 0),
++			transcript: new Text("ordinary", 0, 0),
++			pendingOutput: new Text("pending", 0, 0),
++			getMarkdownTheme,
++			getOutputPad: () => 1,
++			getMarkdownTransformers: () => [],
++		});
++		const message = fauxAssistantMessage("deferred answer", {
++			deferred: { provider: "faux", modelId: "faux-1", api: "faux", id: "pending-response" },
++		});
++		presentation.replaceHistory([message]);
++		presentation.messageEnded(message);
++		presentation.toggleFocus();
++		expect(presentation.document.render(80).join("\n")).not.toContain("deferred answer");
++	});
++
+ 	it("presents header, resources and live transcript in order, with pending output on its own surface", () => {
+ 		const transcript = new Container();
+ 		const assistant = new Text("assistant: starting", 0, 0);
+@@ -14,6 +143,9 @@ describe("ordinary transcript presentation", () => {
+ 			resources: new Text("loaded resources", 0, 0),
+ 			transcript,
+ 			pendingOutput: pending,
++			getMarkdownTheme,
++			getOutputPad: () => 1,
++			getMarkdownTransformers: () => [],
+ 		});
+ 
+ 		expect(presentation.document.render(80).map((line) => line.trimEnd())).toEqual([
+-- 
+2.47.3
+

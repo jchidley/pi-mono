@@ -1,0 +1,10 @@
+
+ RUN  v4.1.11 /home/jack/git/pi-mono/packages/coding-agent
+
+······························································································
+
+ Test Files  7 passed (7)
+      Tests  94 passed (94)
+   Start at  17:04:53
+   Duration  18.46s (transform 34.24s, setup 0ms, import 56.61s, tests 28.20s, environment 2ms)
+

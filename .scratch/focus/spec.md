@@ -8,7 +8,7 @@ Pi's ordinary transcript combines user messages and assistant answers with think
 
 The previous custom `/focus` implementation provided much of this behavior, but upstream upgrades repeatedly required painful fork maintenance. Rebuilding the feature must reduce that ongoing burden through a clean, bounded architecture. A small patch is not sufficient if it spreads knowledge of focus mode across unstable internals.
 
-The owner currently uses stock Pi 1.0.0. This specification describes the approved rebuild, not an existing stock capability. It supersedes conflicting behavior in the archived implementation.
+The approved source baseline is stock Pi 1.0.0. This specification describes the local Focus rebuild, not an existing stock capability. Implementation, original owner acceptance and local consolidation commits are complete; [current target validation and known check exception](upgrade-review.md) are recorded separately. It supersedes conflicting behavior in the archived implementation.
 
 ## Solution
 
@@ -149,9 +149,9 @@ Reuse Pi's native viewport, surrounding controls, search, selection, and renderi
 
 ### Authority and current validation
 
-This is the authoritative feature specification, synthesized from the owner-approved design interview and the subsequently approved testing boundary. `ready-for-agent` records readiness, not authorization to implement.
+This is the authoritative feature specification, synthesized from the owner-approved design interview and the subsequently approved testing boundary. `ready-for-agent` is retained as the original readiness label, not a new implementation queue or blanket side-effect authorization. Requirements below are not relaxed by packaging or a blocked upstream check.
 
-The source review targeted stock Pi release `v1.0.0` at `a13d35a74`. Its findings are a checkpoint, not a guarantee about future releases. No runtime prototype or validation of the revised feature has been performed. Upstream integration and fullscreen behavior still require the tests described above.
+The initial source review targeted stock Pi release `v1.0.0` at `a13d35a74`. That review is historical, not a guarantee about future releases. [Validation](validation.md) records the implemented feature, original owner acceptance, clean baseline commit and later pinned integration checks. Canonical-checkout fixes are committed in `f843f6521` on `stock/pi-1.0.0`, with local records committed separately. The owner declined the unrelated AI-test fix and accepts its known full-check failure for these commits. The separate target cherry-pick remains pending; this is not a full-check pass or a guarantee for future target integration, which still requires the tests described above.
 
 The previous local specification at `packages/coding-agent/docs/focus-spec.md` is now a pointer here, avoiding competing copies. Tracker and domain conventions live in `docs/agents/`. The interactive smoke procedure is `.pi/skills/interactive-testing.md`.
 

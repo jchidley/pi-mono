@@ -1,0 +1,40 @@
+Verified source/test snapshot tree: 201c589a715fab2ba2974e615ffc7109d05f59b4
+c774282cdff2dc874a159fd2e8d66e348b97dda8cd1059e08268e9789bc1ed36  .scratch/focus/upgrade-bundle/focus.patch
+Consolidated patch applies cleanly to v1.0.0 and reproduces verified source/tests including new untracked regressions.
+Applied patch to 'packages/coding-agent/src/core/keybindings.ts' cleanly.
+Applied patch to 'packages/coding-agent/src/core/slash-commands.ts' cleanly.
+Applied patch to 'packages/coding-agent/src/modes/interactive/components/footer.ts' cleanly.
+Applied patch to 'packages/coding-agent/src/modes/interactive/interactive-mode.ts' with conflicts.
+Falling back to direct application...
+Applied patch to 'packages/coding-agent/test/footer-width.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-assistant-diagnostics.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-clone-command.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-compaction.test.ts' cleanly.
+Falling back to direct application...
+Falling back to direct application...
+Falling back to direct application...
+Falling back to direct application...
+Falling back to direct application...
+Applied patch to 'packages/coding-agent/test/interactive-mode-import-command.test.ts' cleanly.
+Falling back to direct application...
+Applied patch to 'packages/coding-agent/test/interactive-mode-startup-input.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-status.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-suspend.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-mode-tree-navigation.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/interactive-tui.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/harness.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/5943-session-start-notify.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/7027-credential-refresh-hang.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/7443-model-command-cached-match.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/7829-invalid-settings-warning.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/9068-user-bash-fail-closed.test.ts' cleanly.
+Applied patch to 'packages/coding-agent/test/suite/regressions/startup-session-rebind-duplicate-subscription.test.ts' cleanly.
+Falling back to direct application...
+Applied patch to 'packages/tui/src/tui-alt-screen.ts' cleanly.
+Falling back to direct application...
+U packages/coding-agent/src/modes/interactive/interactive-mode.ts
+Available upstream replay requires manual integration. Conflicted paths:
+100644 158f59e5f0c3be77655d1775d181a2c39372c7ea 1	packages/coding-agent/src/modes/interactive/interactive-mode.ts
+100644 94e6e14a22276f728f2808a79ca0bd9257935844 2	packages/coding-agent/src/modes/interactive/interactive-mode.ts
+100644 cabfafc063604b8a7c099aa6ba69426b94c456fd 3	packages/coding-agent/src/modes/interactive/interactive-mode.ts

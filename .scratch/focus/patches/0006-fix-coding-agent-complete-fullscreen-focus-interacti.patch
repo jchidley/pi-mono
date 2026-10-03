@@ -1,0 +1,473 @@
+From 494c6c0b674535d21bc6c978e88b7bf58f231546 Mon Sep 17 00:00:00 2001
+From: Jack Chidley <7399749+jchidley@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 09:07:01 +0100
+Subject: [PATCH 6/6] fix(coding-agent): complete fullscreen focus interactions
+ and exit
+
+---
+ .../src/modes/interactive/interactive-mode.ts |  11 +-
+ .../interactive/transcript-presentation.ts    |   5 +
+ ...nteractive-mode-focus-interactions.test.ts | 291 ++++++++++++++++++
+ packages/tui/src/tui-alt-screen.ts            |  12 +
+ .../test/tui-document-interactions.test.ts    |  61 ++++
+ 5 files changed, 379 insertions(+), 1 deletion(-)
+ create mode 100644 packages/coding-agent/test/interactive-mode-focus-interactions.test.ts
+ create mode 100644 packages/tui/test/tui-document-interactions.test.ts
+
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 57604644a..6253d20da 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -37,6 +37,7 @@ import {
+ 	fuzzyFilter,
+ 	getCapabilities,
+ 	hyperlink,
++	isKeyRelease,
+ 	Markdown,
+ 	matchesKey,
+ 	Spacer,
+@@ -892,6 +893,12 @@ export class InteractiveMode {
+ 
+ 	private mountInteractiveTui(tui: TuiMainScreen | TuiAltScreen, components: readonly Component[]): void {
+ 		for (const component of components) tui.addChild(component);
++		// This local action must also work while native transcript search owns keyboard focus.
++		tui.addInputListener((data) => {
++			if (!this.isInitialized || !this.keybindings.matches(data, "app.transcript.toggleFinalOnly")) return;
++			if (!isKeyRelease(data)) this.toggleFocus();
++			return { consume: true };
++		});
+ 		if (TuiLayouts.isViewportTUI(tui)) {
+ 			if (!this.fullscreenLayoutRoot) throw new Error("Fullscreen layout is not initialized");
+ 			tui.setLayoutRoot(this.fullscreenLayoutRoot);
+@@ -911,6 +918,7 @@ export class InteractiveMode {
+ 		const previousUi = this.renderer;
+ 		if (mode === previousUi.mode) return true;
+ 		if (previousUi.hasOverlayEntries) return false;
++		if (mode === "regular") this.transcriptPresentation.disableFocus();
+ 
+ 		const components = [...previousUi.children];
+ 		const focus = previousUi.getFocusedComponent();
+@@ -3086,7 +3094,6 @@ export class InteractiveMode {
+ 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+ 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
+ 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+-		this.defaultEditor.onAction("app.transcript.toggleFinalOnly", () => this.toggleFocus());
+ 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
+ 		this.defaultEditor.onAction(
+ 			"app.message.copy",
+@@ -4604,7 +4611,9 @@ export class InteractiveMode {
+ 			this.showStatus("Focus requires fullscreen mode. Enable it in /settings.");
+ 			return;
+ 		}
++		if (this.renderer instanceof TuiAltScreen) this.renderer.resetDocumentInteractions();
+ 		this.transcriptPresentation.toggleFocus();
++		// Each replacement starts at the bottom; native follow-end handles growth and relayout.
+ 		this.transcriptScrollView?.scrollToEnd();
+ 		this.ui.invalidate();
+ 		this.ui.requestRender();
+diff --git a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+index 080fdc95b..88022affd 100644
+--- a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
++++ b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+@@ -71,6 +71,11 @@ export class TranscriptPresentation {
+ 		this.document.addChild(this.focusEnabled ? this.focused : this.ordinary);
+ 	}
+ 
++	/** Focus is a fullscreen-only viewing preference, never an exit/export policy. */
++	disableFocus(): void {
++		if (this.focusEnabled) this.toggleFocus();
++	}
++
+ 	/** The caller supplies current branch, compaction-aware display history, not the archive. */
+ 	replaceHistory(messages: readonly AgentMessage[]): void {
+ 		this.messages = [...messages];
+diff --git a/packages/coding-agent/test/interactive-mode-focus-interactions.test.ts b/packages/coding-agent/test/interactive-mode-focus-interactions.test.ts
+new file mode 100644
+index 000000000..b4e099e2e
+--- /dev/null
++++ b/packages/coding-agent/test/interactive-mode-focus-interactions.test.ts
+@@ -0,0 +1,291 @@
++import { writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { describe, expect, it, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import type { FullscreenExitOutput } from "../src/core/settings-manager.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import * as clipboard from "../src/utils/clipboard.ts";
++import { createHarness } from "./suite/harness.ts";
++
++function submit(terminal: VirtualTerminal, text: string) {
++	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
++	terminal.sendInput("\r");
++}
++
++async function screen(terminal: VirtualTerminal) {
++	await terminal.waitForRender();
++	return terminal.getViewport().join("\n");
++}
++
++async function setup(exitOutput: FullscreenExitOutput = "resume-hint") {
++	const harness = await createHarness({
++		tools: [
++			{
++				name: "echo",
++				label: "Echo",
++				description: "Offline exit output",
++				parameters: Type.Object({}),
++				execute: async () => ({ content: [{ type: "text", text: "ordinary exit tool detail" }], details: {} }),
++			},
++		],
++		settings: {
++			theme: "dark",
++			quietStartup: true,
++			showCacheMissNotices: false,
++			fullscreenExitOutput: exitOutput,
++			fullscreenCopyOnSelect: false,
++			fullscreenScrollbar: "hidden",
++			hideThinkingBlock: false,
++		},
++	});
++	writeFileSync(
++		join(harness.tempDir, "keybindings.json"),
++		JSON.stringify({ "app.transcript.toggleFinalOnly": ["f6"], "tui.altScreen.search": ["ctrl+shift+f"] }),
++	);
++	vi.stubEnv("PI_CODING_AGENT_DIR", harness.tempDir);
++	const runtime = new AgentSessionRuntime(
++		harness.session,
++		{
++			cwd: harness.tempDir,
++			agentDir: harness.tempDir,
++			modelRuntime: harness.session.modelRuntime,
++			settingsManager: harness.settingsManager,
++			resourceLoader: harness.session.resourceLoader,
++			diagnostics: [],
++		},
++		async () => {
++			throw new Error("Session replacement is outside this test");
++		},
++	);
++	const terminal = new VirtualTerminal(120, 50);
++	const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
++	await mode.init();
++	return {
++		harness,
++		terminal,
++		mode,
++		cleanup: () => {
++			mode.stop("resume-hint");
++			harness.cleanup();
++			vi.unstubAllEnvs();
++			vi.restoreAllMocks();
++		},
++	};
++}
++
++async function select(terminal: VirtualTerminal, text: string) {
++	await terminal.waitForRender();
++	const lines = terminal.getViewport();
++	const row = lines.findIndex((line) => line.includes(text));
++	expect(row).toBeGreaterThanOrEqual(0);
++	const col = lines[row].indexOf(text);
++	terminal.sendInput(`\x1b[<0;${col + 1};${row + 1}M`);
++	terminal.sendInput(`\x1b[<32;${col + text.length};${row + 1}M`);
++	terminal.sendInput(`\x1b[<0;${col + text.length};${row + 1}m`);
++}
++
++describe("native fullscreen focus interactions", () => {
++	it("disables focus when settings switch to regular mode and keeps ordinary view on returning", async () => {
++		const test = await setup();
++		try {
++			test.harness.setResponses([fauxAssistantMessage("mode answer")]);
++			await test.harness.session.prompt("mode user");
++			test.mode.showWarning("ordinary mode diagnostic");
++			submit(test.terminal, "/focus");
++			expect(await screen(test.terminal)).not.toContain("ordinary mode diagnostic");
++			submit(test.terminal, "/settings");
++			test.terminal.sendInput("TUI mode");
++			expect(await screen(test.terminal)).toMatch(/TUI mode +fullscreen/);
++			test.terminal.sendInput("\r");
++			test.terminal.sendInput("\x1b");
++			let output = await screen(test.terminal);
++			expect(output).toContain("ordinary mode diagnostic");
++			expect(output).not.toContain("Focus W:");
++			submit(test.terminal, "/focus");
++			expect(await screen(test.terminal)).toContain("Focus requires fullscreen");
++			submit(test.terminal, "/settings");
++			test.terminal.sendInput("TUI mode");
++			expect(await screen(test.terminal)).toMatch(/TUI mode +regular/);
++			test.terminal.sendInput("\r");
++			test.terminal.sendInput("\x1b");
++			output = await screen(test.terminal);
++			expect(output).toContain("ordinary mode diagnostic");
++			expect(output).not.toContain("Focus W:");
++			test.terminal.sendInput("\x1b[17~");
++			output = await screen(test.terminal);
++			expect(output).toContain("Focus W:0 E:0");
++			expect(output).not.toContain("ordinary mode diagnostic");
++			expect(test.harness.settingsManager.getHideThinkingBlock()).toBe(false);
++			expect(test.harness.faux.state.callCount).toBe(1);
++		} finally {
++			test.cleanup();
++		}
++	});
++
++	it("starts each replacement at the bottom and follows growing output through terminal relayout", async () => {
++		const test = await setup();
++		try {
++			test.terminal.resize(80, 24);
++			test.harness.setResponses([
++				fauxAssistantMessage(`${"old conversation line\n".repeat(50)}first bottom answer`),
++			]);
++			await test.harness.session.prompt("first scroll user");
++			test.mode.showWarning("ordinary bottom diagnostic");
++			expect(await screen(test.terminal)).toContain("first bottom answer");
++			test.terminal.sendInput("\x1bOH");
++			expect(await screen(test.terminal)).not.toContain("first bottom answer");
++			submit(test.terminal, "/focus");
++			expect(await screen(test.terminal)).toContain("first bottom answer");
++			test.harness.setResponses([fauxAssistantMessage("growing bottom answer")]);
++			await test.harness.session.prompt("growing user");
++			expect(await screen(test.terminal)).toContain("growing bottom answer");
++			test.terminal.sendInput("\x1bOH");
++			expect(await screen(test.terminal)).not.toContain("growing bottom answer");
++			test.harness.setResponses([fauxAssistantMessage("hidden latest answer")]);
++			await test.harness.session.prompt("hidden latest user");
++			expect(await screen(test.terminal)).not.toContain("hidden latest answer");
++			// Resize and toggle before the next native frame: no custom position/anchor restoration.
++			test.terminal.resize(60, 18);
++			submit(test.terminal, "/focus");
++			let output = await screen(test.terminal);
++			expect(output).toContain("hidden latest answer");
++			test.terminal.sendInput("\x1bOH");
++			await screen(test.terminal);
++			test.terminal.resize(90, 28);
++			submit(test.terminal, "/focus");
++			output = await screen(test.terminal);
++			expect(output).toContain("hidden latest answer");
++			expect(output).not.toContain("ordinary bottom diagnostic");
++			test.harness.setResponses([fauxAssistantMessage("final growing answer")]);
++			await test.harness.session.prompt("final scroll user");
++			expect(await screen(test.terminal)).toContain("final growing answer");
++		} finally {
++			test.cleanup();
++		}
++	});
++	it.each(["transcript", "resume-hint"] as const)(
++		"honors %s exit output without changing ordinary preferences",
++		async (exitOutput) => {
++			const test = await setup(exitOutput);
++			try {
++				test.terminal.sendInput("\x0f"); // Keep ordinary tool output expanded through focus and exit.
++				submit(test.terminal, "/focus");
++				test.harness.setResponses([
++					fauxAssistantMessage([fauxToolCall("echo", {})], { stopReason: "toolUse" }),
++					fauxAssistantMessage([
++						{ type: "thinking", thinking: "ordinary exit reasoning" },
++						{ type: "text", text: "completed exit answer" },
++					]),
++				]);
++				await test.harness.session.prompt("exit user");
++				test.mode.showWarning("hidden exit diagnostic");
++				const focused = await screen(test.terminal);
++				expect(focused).toContain("completed exit answer");
++				expect(focused).not.toContain("ordinary exit reasoning");
++				expect(focused).not.toContain("hidden exit diagnostic");
++				expect(focused).not.toContain("ordinary exit tool detail");
++				test.mode.stop();
++				await test.terminal.flush();
++				const printed = test.terminal.getScrollBuffer().join("\n");
++				if (exitOutput === "transcript") {
++					for (const text of [
++						"exit user",
++						"completed exit answer",
++						"ordinary exit reasoning",
++						"ordinary exit tool detail",
++						"hidden exit diagnostic",
++					])
++						expect(printed).toContain(text);
++					expect(printed).not.toContain("Focus W:");
++				} else {
++					for (const text of [
++						"exit user",
++						"completed exit answer",
++						"ordinary exit reasoning",
++						"ordinary exit tool detail",
++						"hidden exit diagnostic",
++					])
++						expect(printed).not.toContain(text);
++				}
++				expect(test.harness.settingsManager.getHideThinkingBlock()).toBe(false);
++				expect(test.harness.settingsManager.getFullscreenCopyOnSelect()).toBe(false);
++				expect(test.harness.settingsManager.getFullscreenExitOutput()).toBe(exitOutput);
++			} finally {
++				test.cleanup();
++			}
++		},
++	);
++	it("searches only the selected document and closes search when the configured action replaces it", async () => {
++		const test = await setup();
++		try {
++			test.harness.setResponses([fauxAssistantMessage("visible answer")]);
++			await test.harness.session.prompt("search user");
++			test.mode.showWarning("hiddenneedle");
++			submit(test.terminal, "/focus");
++			test.terminal.sendInput("\x1b[102;6u");
++			test.terminal.sendInput("hiddenneedle");
++			expect(await screen(test.terminal)).toContain("No matches");
++			test.terminal.sendInput("\x1b[17~");
++			let output = await screen(test.terminal);
++			expect(output).not.toContain("Shift+Enter");
++			expect(output).toContain("Warning: hiddenneedle");
++			test.terminal.sendInput("\x1b[102;6u");
++			test.terminal.sendInput("hiddenneedle");
++			expect(await screen(test.terminal)).toContain("1/1");
++			test.terminal.sendInput("\x1b[17~");
++			output = await screen(test.terminal);
++			expect(output).not.toContain("Shift+Enter");
++			expect(output).not.toContain("hiddenneedle");
++			test.terminal.sendInput("draft after search");
++			expect(await screen(test.terminal)).toContain("draft after search");
++			test.terminal.sendInput("\x1b[102;6u");
++			expect(await screen(test.terminal)).toContain("Find in transcript");
++			test.terminal.sendInput("visible answer");
++			expect(await screen(test.terminal)).toContain("1/1");
++			expect(test.harness.session.pendingMessageCount).toBe(0);
++			expect(test.harness.faux.state.callCount).toBe(1);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it("copies visible selected text, leaves /copy meaning unchanged, and clears selection in both switch directions", async () => {
++		const test = await setup();
++		const copied: string[] = [];
++		vi.spyOn(clipboard, "copyToClipboard").mockImplementation(async (text) => {
++			copied.push(text);
++		});
++		try {
++			test.harness.setResponses([fauxAssistantMessage("last assistant answer")]);
++			await test.harness.session.prompt("visible user text");
++			submit(test.terminal, "/focus");
++			await select(test.terminal, "visible user text");
++			test.terminal.sendInput("\x18");
++			await screen(test.terminal);
++			expect(copied).toEqual(["visible user text"]);
++			submit(test.terminal, "/copy");
++			await screen(test.terminal);
++			expect(copied).toEqual(["visible user text", "last assistant answer"]);
++			submit(test.terminal, "/focus");
++			await screen(test.terminal);
++			test.terminal.sendInput("\x18");
++			await screen(test.terminal);
++			expect(copied).toEqual(["visible user text", "last assistant answer", "last assistant answer"]);
++			await select(test.terminal, "visible user text");
++			submit(test.terminal, "/focus");
++			await screen(test.terminal);
++			test.terminal.sendInput("\x18");
++			await screen(test.terminal);
++			expect(copied).toEqual([
++				"visible user text",
++				"last assistant answer",
++				"last assistant answer",
++				"last assistant answer",
++			]);
++		} finally {
++			test.cleanup();
++		}
++	});
++});
+diff --git a/packages/tui/src/tui-alt-screen.ts b/packages/tui/src/tui-alt-screen.ts
+index 8e534a359..493e9ea69 100644
+--- a/packages/tui/src/tui-alt-screen.ts
++++ b/packages/tui/src/tui-alt-screen.ts
+@@ -312,6 +312,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		return this.copyTextToClipboard(text);
+ 	}
+ 
++	/** Clear positions and gestures belonging to a replaced transcript, preserving other overlays. */
++	resetDocumentInteractions(): void {
++		this.closeSearch();
++		this.clearTextSelection();
++		this.lastClick = undefined;
++		this.stopScrollbarHover();
++		this.stopScrollbarDrag();
++		this.clearComponentMouseGesture();
++		this.lastComponentClick = undefined;
++		this.requestRender();
++	}
++
+ 	/** The lines of the last rendered frame, one per terminal row, as written to the terminal. */
+ 	getScreenLines(): string[] {
+ 		return [...this.previousScreen];
+diff --git a/packages/tui/test/tui-document-interactions.test.ts b/packages/tui/test/tui-document-interactions.test.ts
+new file mode 100644
+index 000000000..7170521f1
+--- /dev/null
++++ b/packages/tui/test/tui-document-interactions.test.ts
+@@ -0,0 +1,61 @@
++import assert from "node:assert/strict";
++import { it } from "node:test";
++import { ScrollView } from "../src/components/scroll-view.ts";
++import { Text } from "../src/components/text.ts";
++import { VStack } from "../src/components/v-stack.ts";
++import { TuiAltScreen } from "../src/tui-alt-screen.ts";
++import { VirtualTerminal } from "./virtual-terminal.ts";
++
++it("resets document search and selection without closing unrelated overlays or losing editor input", async () => {
++	const terminal = new VirtualTerminal(100, 12);
++	const copied: string[] = [];
++	const tui = new TuiAltScreen(terminal, undefined, undefined, {
++		copyOnSelect: false,
++		copySelection: async (text) => {
++			copied.push(text);
++			return true;
++		},
++	});
++	const text = new Text("old document needle", 0, 0);
++	const inputs: string[] = [];
++	const editor = { render: () => ["editor"], invalidate: () => {}, handleInput: (data: string) => inputs.push(data) };
++	tui.setLayoutRoot(
++		new VStack([
++			{ component: new ScrollView(text, { follow: "end", primary: true }), basis: 0, grow: 1 },
++			{ component: editor, basis: 1 },
++		]),
++	);
++	tui.setFocus(editor);
++	tui.start();
++	try {
++		await terminal.waitForRender();
++		terminal.sendInput("\x1b[<0;1;1M");
++		terminal.sendInput("\x1b[<32;12;1M");
++		terminal.sendInput("\x1b[<0;12;1m");
++		assert.equal(await tui.copyActiveSelectionToClipboard(), true);
++		assert.deepEqual(copied, ["old document"]);
++		const overlay = tui.showOverlay(new Text("unrelated overlay", 0, 0), {
++			nonCapturing: true,
++			anchor: "bottom-left",
++		});
++		terminal.sendInput("\x1b[102;6u");
++		terminal.sendInput("needle");
++		await terminal.waitForRender();
++		assert.match(terminal.getViewport().join("\n"), /1\/1/);
++		tui.resetDocumentInteractions();
++		text.setText("replacement document");
++		await terminal.waitForRender();
++		assert.equal(await tui.copyActiveSelectionToClipboard(), false);
++		assert.deepEqual(copied, ["old document"]);
++		assert.doesNotMatch(terminal.getViewport().join("\n"), /Shift\+Enter/);
++		assert.match(terminal.getViewport().join("\n"), /unrelated overlay/);
++		terminal.sendInput("editor draft");
++		assert.deepEqual(inputs, ["editor draft"]);
++		overlay.hide();
++		terminal.sendInput("\x1b[102;6u");
++		await terminal.waitForRender();
++		assert.match(terminal.getViewport().join("\n"), /Find in transcript/);
++	} finally {
++		tui.stop({ preserveScreen: true });
++	}
++});
+-- 
+2.47.3
+

@@ -99,6 +99,10 @@ If you need stronger boundaries, containerize or sandbox Pi. See [packages/codin
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
 
+## Local fork work
+
+Focus has a clean replayable baseline and completed local consolidation commits on `stock/pi-1.0.0`. The owner accepts the known unchanged upstream AI-test check failure; the separate target cherry-pick remains pending. Read the [Focus current state and next gate](.scratch/focus/upgrade-review.md), then [Task 08](.scratch/focus/issues/08-clean-replayable-focus-commit-set.md). The [Focus specification](.scratch/focus/spec.md) owns behavior; validation and baseline delivery evidence are linked from the plan. Publication and deployment are not authorized.
+
 ## Development
 
 ```bash

@@ -1,0 +1,360 @@
+
+--- startup ---
+
+ FIXTURE FOCUS-A USER MARKER
+
+
+ PRIVATE FOCUS-A REASONING MARKER
+
+ FIXTURE FOCUS-A ANSWER MARKER
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+0.0%/128k (auto)                                                                                           (faux) faux-1
+
+--- ordinary-live ---
+
+ FIXTURE FOCUS-A USER MARKER
+
+
+ PRIVATE FOCUS-A REASONING MARKER
+
+ FIXTURE FOCUS-A ANSWER MARKER
+
+
+ FIXTURE LIVE HOST USER MARKER
+
+
+ PRIVATE LIVE HOST REASONING
+
+ LIVE HOST PARTIAL ANSWER IS STREAMING SLOWLY
+
+
+ fixture-note note="LIVE HOST SAFE HARMLESS MARKER"
+ FIXTURE TOOL UPDATE LIVE HOST SAFE HARMLESS MARKER
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+── ⠙ Working ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+↑530 ↓32 0.4%/128k (auto)                                                                                  (faux) faux-1
+
+--- focused-final-resize ---
+
+ FIXTURE FOCUS-A USER MARKER
+
+
+ FIXTURE FOCUS-A ANSWER MARKER
+
+
+ FIXTURE LIVE HOST USER MARKER
+
+
+ LIVE HOST FINAL ANSWER MARKER
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+↑1.1k ↓48 0.5%/128k (auto)                                                     (faux) faux-1
+                                                                               Focus W:0 E:0
+
+--- resumed-b ---
+
+ FIXTURE FOCUS-B USER MARKER
+
+
+ FIXTURE FOCUS-B ANSWER MARKER
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-B
+0.0%/128k (auto)                                                               (faux) faux-1
+                                                                               Focus W:0 E:0
+
+--- native-resume-picker ---
+
+
+ ✓ New session started
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Resume Session (Current Folder)          ◉ Current Folder | ○ All  Name: All  Sort: Threaded
+tab scope · re:<pattern> regex · "phrase" exact
+ctrl+s sort · ctrl+n named · ctrl+d delete · ctrl+p path (off) · ctrl+r rename
+
+>
+
+› FOCUS-A                                                                              7 now
+  FOCUS-B                                                                              2 now
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk
+0.0%/128k (auto)                                                               (faux) faux-1
+                                                                               Focus W:0 E:0
+
+--- regular-explanation ---
+
+
+ PRIVATE LIVE HOST REASONING
+
+ LIVE HOST PARTIAL ANSWER IS STREAMING SLOWLY
+
+
+ fixture-note note="LIVE HOST SAFE HARMLESS MARKER"
+ FIXTURE TOOL RESULT LIVE HOST SAFE HARMLESS MARKER
+
+
+ PRIVATE LIVE HOST FINAL REASONING
+
+ LIVE HOST FINAL ANSWER MARKER
+
+ TUI mode: regular
+
+ Focus requires fullscreen mode. Enable it in /settings.
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+↑1.1k ↓48 0.5%/128k (auto)                                                     (faux) faux-1
+
+
+
+
+
+--- transcript-exit ---
+
+ LIVE HOST FINAL ANSWER MARKER
+
+ TUI mode: regular
+
+ Focus requires fullscreen mode. Enable it in /settings.
+
+ TUI mode: fullscreen
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+↑1.1k ↓48 0.5%/128k (auto)                                                     (faux) faux-1
+
+To resume this session: pi --session-dir /tmp/pi-focus-owner-validation/run-aBeXIF/sessions
+--session 01a101cf-b6e3-77f8-adf4-0e869d3229a8
+
+FIXTURE_EXIT:0
+
+
+
+
+
+
+
+
+
+bash /tmp/pi-focus-owner-validation/launch.sh --native --exit-transcript; printf '\nFIXTURE_
+EXIT:%s\n' "$?"
+# Quick hints
+
+# Search/history
+rg <pattern> <path>              # fast search
+fd <name>                        # fast find
+history                         # show shell history (McFly normally saves it automatically)
+Ctrl-R                          # McFly history search
+history -a                      # manually flush current shell history when needed
+!<num>                          # rerun history entry by number
+
+# Secrets (GPG/ak)
+ak list                          # show configured services + status
+ak get <service>                 # decrypt one secret; capture inside the consuming command,
+ not agent output
+~/.envrc                         # reviewed allowlist; direnv loads these services on enteri
+ng the directory
+direnv reload                    # refresh exports after changing the vault or profile
+gpgconf --kill gpg-agent         # lock GPG cache immediately (default TTL: 20h)
+credential-reset                # visible WSL terminal: start fresh GPG + SSH window (prompt
+s again)
+ssh-add -l                       # check SSH identities when needed (default TTL: 20h)
+
+# WSL/Windows helpers
+wslpath "C:\Users\jackc\Downloads"  # Windows path -> WSL path
+# Optional shell aliases: clipcopy, clippaste, snip, shot, screenshot
+
+# tmux helpers (optional)
+t                               # new isolated socketed session
+tmux ls                         # default socket only; does not list sessions created by t
+tclean                          # cleanup unattached t sessions
+jack@black:~/git/pi-mono$ bash /tmp/pi-focus-owner-validation/launch.sh --native --exit-tran
+script; printf '\nFIXTURE_EXIT:%s\n' "$?"
+
+ FIXTURE FOCUS-A USER MARKER
+
+
+ PRIVATE FOCUS-A REASONING MARKER
+
+ FIXTURE FOCUS-A ANSWER MARKER
+
+
+ FIXTURE LIVE HOST USER MARKER
+
+
+ PRIVATE LIVE HOST REASONING
+
+ LIVE HOST PARTIAL ANSWER IS STREAMING SLOWLY
+
+
+ fixture-note note="LIVE HOST SAFE HARMLESS MARKER"
+ FIXTURE TOOL RESULT LIVE HOST SAFE HARMLESS MARKER
+
+
+ PRIVATE LIVE HOST FINAL REASONING
+
+ LIVE HOST FINAL ANSWER MARKER
+
+ TUI mode: regular
+
+ Focus requires fullscreen mode. Enable it in /settings.
+
+ TUI mode: fullscreen
+
+────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────
+/tmp/pi-focus-owner-validation/run-aBeXIF/work/pi-suite-1791031752278-sfez7c7hbbk • FOCUS-A
+↑1.1k ↓48 0.5%/128k (auto)                                                     (faux) faux-1
+
+To resume this session: pi --session-dir /tmp/pi-focus-owner-validation/run-aBeXIF/sessions
+--session 01a101cf-b6e3-77f8-adf4-0e869d3229a8
+
+FIXTURE_EXIT:0
+jack@black:~/git/pi-mono$
+
+
+
+
+
+
+
+
+
+--- resume-hint-exit ---
+bash /tmp/pi-focus-owner-validation/launch.sh --native --exit-hint; printf '\nFIXTURE_EXIT:%s\n' "$?"
+# Quick hints
+
+# Search/history
+rg <pattern> <path>              # fast search
+fd <name>                        # fast find
+history                         # show shell history (McFly normally saves it automatically)
+Ctrl-R                          # McFly history search
+history -a                      # manually flush current shell history when needed
+!<num>                          # rerun history entry by number
+
+# Secrets (GPG/ak)
+ak list                          # show configured services + status
+ak get <service>                 # decrypt one secret; capture inside the consuming command, not agent output
+~/.envrc                         # reviewed allowlist; direnv loads these services on entering the directory
+direnv reload                    # refresh exports after changing the vault or profile
+gpgconf --kill gpg-agent         # lock GPG cache immediately (default TTL: 20h)
+credential-reset                # visible WSL terminal: start fresh GPG + SSH window (prompts again)
+ssh-add -l                       # check SSH identities when needed (default TTL: 20h)
+
+# WSL/Windows helpers
+wslpath "C:\Users\jackc\Downloads"  # Windows path -> WSL path
+# Optional shell aliases: clipcopy, clippaste, snip, shot, screenshot
+
+# tmux helpers (optional)
+t                               # new isolated socketed session
+tmux ls                         # default socket only; does not list sessions created by t
+tclean                          # cleanup unattached t sessions
+jack@black:~/git/pi-mono$ bash /tmp/pi-focus-owner-validation/launch.sh --native --exit-hint; printf '\nFIXTURE_EXIT:%s\
+n' "$?"
+To resume this session: pi --session-dir /tmp/pi-focus-owner-validation/run-5BaQYE/sessions --session 01a101d0-0af8-7530
+-8767-80b40e334ee7
+
+FIXTURE_EXIT:0
+
+
+
+
+
+
