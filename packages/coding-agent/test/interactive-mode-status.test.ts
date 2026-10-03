@@ -635,6 +635,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 			getCompactExtensionLabels: (extensions: ExtensionFixture[]) =>
 				(InteractiveMode as any).prototype.getCompactExtensionLabels.call(fakeThis, extensions),
 			formatDiagnostics: () => "diagnostics",
+			getLoadedResourceDiagnostics: Reflect.get(InteractiveMode.prototype, "getLoadedResourceDiagnostics"),
 			getBuiltInCommandConflictDiagnostics: () => [],
 		};
 

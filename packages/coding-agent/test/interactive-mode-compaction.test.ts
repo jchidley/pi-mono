@@ -164,6 +164,13 @@ describe("InteractiveMode compaction events", () => {
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
 			chatContainer: { clear: vi.fn() },
+			transcriptPresentation: {
+				rebuildPreservingExplicitOutput: (_component: unknown, rebuild: () => void) => rebuild(),
+			},
+			rebuildChatFromMessages: Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages") as (
+				entries: SessionEntry[],
+				render: () => void,
+			) => void,
 			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
 			reconcilePresentedHistory: vi.fn(),
 			renderSessionEntries: vi.fn(),
