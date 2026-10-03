@@ -1,0 +1,975 @@
+From 48045db6f9adab283e4934e44c9954bdc5f3cd3e Mon Sep 17 00:00:00 2001
+From: Jack Chidley <7399749+jchidley@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 23:32:11 +0100
+Subject: [PATCH 5/6] feat(coding-agent): add quiet focus diagnostic awareness
+
+---
+ .../modes/interactive/components/footer.ts    |  23 +-
+ .../src/modes/interactive/interactive-mode.ts |  10 +-
+ .../interactive/transcript-presentation.ts    |  21 ++
+ .../coding-agent/test/footer-width.test.ts    |  32 ++
+ ...ractive-mode-assistant-diagnostics.test.ts | 178 +++++-----
+ .../interactive-mode-focus-lifecycle.test.ts  |  17 +
+ .../interactive-mode-focus-output.test.ts     |   2 +
+ .../test/interactive-mode-focus.test.ts       | 310 ++++++++++++++++++
+ .../test/interactive-mode-status.test.ts      |  55 +++-
+ .../test/transcript-presentation.test.ts      |  40 +++
+ 10 files changed, 590 insertions(+), 98 deletions(-)
+
+diff --git a/packages/coding-agent/src/modes/interactive/components/footer.ts b/packages/coding-agent/src/modes/interactive/components/footer.ts
+index 8bb7b353e..a77806c2c 100644
+--- a/packages/coding-agent/src/modes/interactive/components/footer.ts
++++ b/packages/coding-agent/src/modes/interactive/components/footer.ts
+@@ -64,10 +64,16 @@ export class FooterComponent implements Component {
+ 	private session: AgentSession;
+ 	private footerData: ReadonlyFooterDataProvider;
+ 	private sessionStats?: SessionStats;
++	private readonly getPresentationStatus: () => string | undefined;
+ 
+-	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
++	constructor(
++		session: AgentSession,
++		footerData: ReadonlyFooterDataProvider,
++		getPresentationStatus: () => string | undefined = () => undefined,
++	) {
+ 		this.session = session;
+ 		this.footerData = footerData;
++		this.getPresentationStatus = getPresentationStatus;
+ 	}
+ 
+ 	setSession(session: AgentSession): void {
+@@ -288,13 +294,22 @@ export class FooterComponent implements Component {
+ 
+ 		// Add extension statuses on a single line, sorted by key alphabetically
+ 		const extensionStatuses = this.footerData.getExtensionStatuses();
+-		if (extensionStatuses.size > 0) {
++		const presentationStatus = this.getPresentationStatus();
++		if (extensionStatuses.size > 0 || presentationStatus) {
+ 			const sortedStatuses = Array.from(extensionStatuses.entries())
+ 				.sort(([a], [b]) => a.localeCompare(b))
+ 				.map(([, text]) => sanitizeStatusText(text));
+ 			const statusLine = sortedStatuses.join(" ");
+-			// Truncate to terminal width with dim ellipsis for consistency with footer style
+-			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
++			if (presentationStatus) {
++				// Reserve the right side for native presentation status; extensions keep the left.
++				const right = truncateToWidth(theme.fg("dim", presentationStatus), width, "");
++				const rightWidth = visibleWidth(right);
++				const leftWidth = Math.max(0, width - rightWidth - 2);
++				const left = truncateToWidth(statusLine, leftWidth, theme.fg("dim", "..."));
++				lines.push(left + " ".repeat(Math.max(0, width - visibleWidth(left) - rightWidth)) + right);
++			} else {
++				lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
++			}
+ 		}
+ 
+ 		return lines;
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 0059164fb..57604644a 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -669,7 +669,9 @@ export class InteractiveMode {
+ 		this.editorContainer = new Container();
+ 		this.editorContainer.addChild(this.editor as Component);
+ 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
+-		this.footer = new FooterComponent(this.session, this.footerDataProvider);
++		this.footer = new FooterComponent(this.session, this.footerDataProvider, () =>
++			this.transcriptPresentation.getStatus(),
++		);
+ 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+ 		this.footerContainer = new Container();
+ 		this.footerContainer.addChild(this.footer);
+@@ -3021,6 +3023,7 @@ export class InteractiveMode {
+ 	 * Show an extension error in the UI.
+ 	 */
+ 	private showExtensionError(extensionPath: string, error: string, stack?: string): void {
++		this.transcriptPresentation.reportDiagnostic("error");
+ 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
+ 		const errorText = new ThemedText(() => theme.fg("error", errorMsg), 1, 0);
+ 		this.chatContainer.addChild(errorText);
+@@ -3732,6 +3735,7 @@ export class InteractiveMode {
+ 					if (event.reason === "manual") {
+ 						this.showError(event.errorMessage, intent);
+ 					} else {
++						this.transcriptPresentation.reportDiagnostic("error");
+ 						this.chatContainer.addChild(new Spacer(1));
+ 						const errorMessage = event.errorMessage;
+ 						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
+@@ -3810,6 +3814,7 @@ export class InteractiveMode {
+ 
+ 	/** Show a managed-tool status update in the chat. */
+ 	private showManagedToolStatus(status: ToolStatus): void {
++		if (status.type === "warning") this.transcriptPresentation.reportDiagnostic("warning");
+ 		if (!this.managedToolStatusStarted) {
+ 			this.chatContainer.addChild(new Spacer(1));
+ 			this.managedToolStatusStarted = true;
+@@ -4193,6 +4198,7 @@ export class InteractiveMode {
+ 		}
+ 		if (droppedCount <= previousDroppedCount) return;
+ 
++		this.transcriptPresentation.reportDiagnostic("warning");
+ 		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
+ 		this.chatContainer.addChild(new Spacer(1));
+ 		this.chatContainer.addChild(
+@@ -4671,6 +4677,7 @@ export class InteractiveMode {
+ 	}
+ 
+ 	showError(errorMessage: string, intent: TranscriptOutputIntent = "background"): void {
++		this.transcriptPresentation.reportDiagnostic("error");
+ 		const spacer = new Spacer(1);
+ 		const text = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
+ 		this.transcriptPresentation.addOutput(spacer, intent);
+@@ -4679,6 +4686,7 @@ export class InteractiveMode {
+ 	}
+ 
+ 	showWarning(warningMessage: string, intent: TranscriptOutputIntent = "background"): void {
++		this.transcriptPresentation.reportDiagnostic("warning");
+ 		const spacer = new Spacer(1);
+ 		const text = new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0);
+ 		this.transcriptPresentation.addOutput(spacer, intent);
+diff --git a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+index d5ba6f781..080fdc95b 100644
+--- a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
++++ b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+@@ -37,6 +37,8 @@ export class TranscriptPresentation {
+ 	private readonly messageComponents = new Map<Component, AgentMessage>();
+ 	private readonly explicitOutput = new Set<Component>();
+ 	private focusEnabled = false;
++	private warnings = 0;
++	private errors = 0;
+ 
+ 	constructor(options: TranscriptPresentationOptions) {
+ 		this.options = options;
+@@ -49,7 +51,20 @@ export class TranscriptPresentation {
+ 		this.pendingOutput = options.pendingOutput;
+ 	}
+ 
++	/** Counts describe live diagnostics since entering focus, not unread or historical messages. */
++	getStatus(): string | undefined {
++		return this.focusEnabled ? `Focus W:${this.warnings} E:${this.errors}` : undefined;
++	}
++
++	reportDiagnostic(severity: "warning" | "error"): void {
++		if (!this.focusEnabled) return;
++		if (severity === "warning") this.warnings++;
++		else this.errors++;
++	}
++
+ 	toggleFocus(): void {
++		this.warnings = 0;
++		this.errors = 0;
+ 		this.focusEnabled = !this.focusEnabled;
+ 		if (this.focusEnabled) this.refreshConversation();
+ 		this.document.clear();
+@@ -109,6 +124,8 @@ export class TranscriptPresentation {
+ 
+ 	/** Session-local presentation state is discarded, but the process-local viewing preference survives. */
+ 	resetSession(): void {
++		this.warnings = 0;
++		this.errors = 0;
+ 		this.options.pendingOutput.clear();
+ 		this.messageComponents.clear();
+ 		this.explicitOutput.clear();
+@@ -123,6 +140,10 @@ export class TranscriptPresentation {
+ 
+ 	/** Consume the completed event directly: listeners run before session persistence. */
+ 	messageEnded(message: AgentMessage): void {
++		if (message.role === "assistant") {
++			if (message.stopReason === "error" || message.stopReason === "aborted") this.reportDiagnostic("error");
++			else if (message.stopReason === "length") this.reportDiagnostic("warning");
++		}
+ 		if (message.role !== "assistant" && message.role !== "user") return;
+ 		if (!this.messages.includes(message)) this.messages.push(message);
+ 		this.refreshConversation();
+diff --git a/packages/coding-agent/test/footer-width.test.ts b/packages/coding-agent/test/footer-width.test.ts
+index 12c074d01..c86798636 100644
+--- a/packages/coding-agent/test/footer-width.test.ts
++++ b/packages/coding-agent/test/footer-width.test.ts
+@@ -122,6 +122,38 @@ describe("FooterComponent width handling", () => {
+ 		initTheme(undefined, false);
+ 	});
+ 
++	it("right-aligns focus beside sorted extension statuses without changing their content", () => {
++		const data = createFooterData(1);
++		const statuses = new Map([
++			["other", "other\nstatus"],
++			["codex", "Cdx"],
++		]);
++		data.getExtensionStatuses = () => statuses;
++		let status: string | undefined = "Focus W:2 E:1";
++		const footer = new FooterComponent(createSession({ sessionName: "" }), data, () => status);
++		expect(stripAnsi(footer.render(40)[2])).toBe("Cdx other status           Focus W:2 E:1");
++		expect(statuses.get("other")).toBe("other\nstatus");
++		status = undefined;
++		expect(stripAnsi(footer.render(40)[2])).toBe("Cdx other status");
++	});
++
++	it.each([0, 1, 2, 5, 12, 13, 15, 20, 40])("keeps native focus status within %s columns", (width) => {
++		const data = createFooterData(1);
++		data.getExtensionStatuses = () => new Map([["wide", "模".repeat(30)]]);
++		const footer = new FooterComponent(createSession({ sessionName: "" }), data, () => "Focus W:2 E:1");
++		const lines = footer.render(width);
++		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
++		if (width >= 13) expect(stripAnsi(lines[2])).toMatch(/Focus W:2 E:1$/);
++	});
++
++	it("shows focus on an otherwise empty extension-status row and removes that row on leaving focus", () => {
++		let status: string | undefined = "Focus W:0 E:0";
++		const footer = new FooterComponent(createSession({ sessionName: "" }), createFooterData(1), () => status);
++		expect(stripAnsi(footer.render(20)[2])).toBe("       Focus W:0 E:0");
++		status = undefined;
++		expect(footer.render(20)).toHaveLength(2);
++	});
++
+ 	it("keeps all lines within width for wide session names", () => {
+ 		const width = 93;
+ 		const session = createSession({ sessionName: "한글".repeat(30) });
+diff --git a/packages/coding-agent/test/interactive-mode-assistant-diagnostics.test.ts b/packages/coding-agent/test/interactive-mode-assistant-diagnostics.test.ts
+index 48732b52d..2034ec452 100644
+--- a/packages/coding-agent/test/interactive-mode-assistant-diagnostics.test.ts
++++ b/packages/coding-agent/test/interactive-mode-assistant-diagnostics.test.ts
+@@ -1,95 +1,121 @@
+-import type { AssistantMessage } from "@earendil-works/pi-ai";
+-import { Container } from "@earendil-works/pi-tui";
+-import { describe, expect, test } from "vitest";
++import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
++import { describe, expect, it } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+-import { stripAnsi } from "../src/utils/ansi.ts";
++import { createHarness } from "./suite/harness.ts";
+ 
+-const message: AssistantMessage = {
+-	role: "assistant",
+-	content: [{ type: "text", text: "survived" }],
+-	api: "anthropic-messages",
+-	provider: "anthropic",
+-	model: "claude-fable-5-1",
+-	usage: {
+-		input: 1,
+-		output: 1,
+-		cacheRead: 0,
+-		cacheWrite: 0,
+-		totalTokens: 2,
+-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+-	},
+-	stopReason: "stop",
+-	timestamp: 1,
+-	diagnostics: [
++function droppedThinkingMessage() {
++	const message = fauxAssistantMessage("survived");
++	message.diagnostics = [
+ 		{
+ 			type: "anthropic_input_transformations",
+ 			timestamp: 1,
+ 			details: {
+ 				transformations: [
+-					{
+-						type: "thinking_dropped",
+-						path: "messages.2.content.0",
+-						reason: "prefix_binding_mismatch",
+-					},
+-					{
+-						type: "thinking_dropped",
+-						path: "messages.5.content.0",
+-						reason: "prefix_binding_mismatch",
+-					},
+-					{
+-						type: "thinking_dropped",
+-						path: "messages.8.content.0",
+-						reason: "prefix_binding_mismatch",
+-					},
++					{ type: "thinking_dropped", path: "messages.2.content.0", reason: "prefix_binding_mismatch" },
++					{ type: "thinking_dropped", path: "messages.5.content.0", reason: "prefix_binding_mismatch" },
++					{ type: "thinking_dropped", path: "messages.8.content.0", reason: "prefix_binding_mismatch" },
+ 				],
+ 			},
+ 		},
+-	],
+-};
++	];
++	return message;
++}
+ 
+-type NoticeContext = {
+-	chatContainer: Container;
+-	settingsManager: { getShowCacheMissNotices(): boolean };
+-	sessionManager: { getBranch(): Array<{ type: "message"; message: AssistantMessage }> };
+-};
++function submit(terminal: VirtualTerminal, text: string) {
++	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
++	terminal.sendInput("\r");
++}
+ 
+-const maybeShowThinkingDropNotice = Reflect.get(InteractiveMode.prototype, "maybeShowThinkingDropNotice") as (
+-	this: NoticeContext,
+-	message: AssistantMessage,
+-) => void;
++async function screen(terminal: VirtualTerminal) {
++	await terminal.waitForRender();
++	return terminal.getViewport().join("\n");
++}
+ 
+-describe("InteractiveMode assistant diagnostics", () => {
+-	test("shows Anthropic thinking drops when cache miss notices are enabled", () => {
+-		initTheme("dark");
+-		const enabled = {
+-			chatContainer: new Container(),
+-			settingsManager: { getShowCacheMissNotices: () => true },
+-			sessionManager: { getBranch: () => [] },
+-		};
+-		maybeShowThinkingDropNotice.call(enabled, message);
+-		const output = stripAnsi(enabled.chatContainer.render(120).join("\n"));
+-		expect(output).toContain("Anthropic dropped 3 thinking blocks (details in session)");
++async function setup(showCacheMissNotices: boolean) {
++	const harness = await createHarness({ settings: { theme: "dark", quietStartup: true, showCacheMissNotices } });
++	const runtime = new AgentSessionRuntime(
++		harness.session,
++		{
++			cwd: harness.tempDir,
++			agentDir: harness.tempDir,
++			modelRuntime: harness.session.modelRuntime,
++			settingsManager: harness.settingsManager,
++			resourceLoader: harness.session.resourceLoader,
++			diagnostics: [],
++		},
++		async () => {
++			throw new Error("Session replacement is outside this diagnostic scenario");
++		},
++	);
++	const terminal = new VirtualTerminal(120, 60);
++	const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
++	return {
++		harness,
++		terminal,
++		mode,
++		cleanup: () => {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		},
++	};
++}
+ 
+-		const disabled = {
+-			chatContainer: new Container(),
+-			settingsManager: { getShowCacheMissNotices: () => false },
+-			sessionManager: { getBranch: () => [] },
+-		};
+-		maybeShowThinkingDropNotice.call(disabled, message);
+-		expect(disabled.chatContainer.children).toHaveLength(0);
+-	});
++const notice = "Anthropic dropped 3 thinking blocks (details in session)";
+ 
+-	test("does not repeat unchanged Anthropic thinking drops", () => {
+-		initTheme("dark");
+-		const context = {
+-			chatContainer: new Container(),
+-			settingsManager: { getShowCacheMissNotices: () => true },
+-			sessionManager: { getBranch: () => [{ type: "message" as const, message }] },
+-		};
++describe("InteractiveMode assistant diagnostics", () => {
++	it.each([false, true])("counts only emitted thinking-drop warnings (notices enabled=%s)", async (enabled) => {
++		const test = await setup(enabled);
++		try {
++			await test.mode.init();
++			submit(test.terminal, "/focus");
++			test.harness.setResponses([droppedThinkingMessage()]);
++			await test.harness.session.prompt("thinking drop user");
++			let output = await screen(test.terminal);
++			expect(output).toContain(enabled ? "Focus W:1 E:0" : "Focus W:0 E:0");
++			expect(output).toContain("survived");
++			expect(output).not.toContain(notice);
++			submit(test.terminal, "/focus");
++			output = await screen(test.terminal);
++			if (enabled) expect(output.split("\n").map((line) => line.trim())).toContain(notice);
++			else expect(output).not.toContain(notice);
++			expect(output).not.toContain(`Warning: ${notice}`);
++			expect(test.harness.faux.state.callCount).toBe(1);
++		} finally {
++			test.cleanup();
++		}
++	});
+ 
+-		maybeShowThinkingDropNotice.call(context, { ...message, timestamp: 2 });
++	it("does not repeat unchanged thinking-drop warnings across live turns", async () => {
++		const test = await setup(true);
++		try {
++			await test.mode.init();
++			submit(test.terminal, "/focus");
++			test.harness.setResponses([droppedThinkingMessage(), droppedThinkingMessage()]);
++			await test.harness.session.prompt("first drop turn");
++			await test.harness.session.prompt("unchanged drop turn");
++			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
++			submit(test.terminal, "/focus");
++			expect((await screen(test.terminal)).match(/Anthropic dropped 3 thinking blocks/g)).toHaveLength(1);
++		} finally {
++			test.cleanup();
++		}
++	});
+ 
+-		expect(context.chatContainer.children).toHaveLength(0);
++	it("does not replay saved thinking-drop diagnostics when entering focus", async () => {
++		const test = await setup(true);
++		try {
++			test.harness.sessionManager.appendMessage(droppedThinkingMessage());
++			test.harness.session.refreshContext();
++			await test.mode.init();
++			submit(test.terminal, "/focus");
++			expect(await screen(test.terminal)).toContain("Focus W:0 E:0");
++			test.harness.setResponses([droppedThinkingMessage()]);
++			await test.harness.session.prompt("unchanged historical drops");
++			expect(await screen(test.terminal)).toContain("Focus W:0 E:0");
++		} finally {
++			test.cleanup();
++		}
+ 	});
+ });
+diff --git a/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts b/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
+index 3eedd6248..02872fa51 100644
+--- a/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
++++ b/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
+@@ -689,6 +689,8 @@ describe("focus lifecycle", () => {
+ 			await test.mode.init();
+ 			submit(test.terminal, "/focus");
+ 			expect(await screen(test.terminal)).toContain("first rendering");
++			test.mode.showWarning("diagnostic before reload");
++			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
+ 			const records = structuredClone(test.initial.sessionManager.getEntries());
+ 			const context = structuredClone(test.initial.session.messages);
+ 			label = "reloaded rendering";
+@@ -696,10 +698,12 @@ describe("focus lifecycle", () => {
+ 			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("reload finished"));
+ 			const output = await screen(test.terminal);
+ 			expect(output).toContain("reloaded rendering");
++			expect(output).toContain("Focus W:1 E:0");
+ 			expect(output).not.toContain("first rendering");
+ 			expect(output).not.toContain("ordinary reasoning");
+ 			test.mode.showWarning("reload ordinary warning");
+ 			expect(await screen(test.terminal)).not.toContain("reload ordinary warning");
++			expect(await screen(test.terminal)).toContain("Focus W:2 E:0");
+ 			expect(test.initial.sessionManager.getEntries()).toEqual(records);
+ 			expect(test.initial.session.messages).toEqual(context);
+ 			expect(test.initial.settingsManager.getHideThinkingBlock()).toBe(true);
+@@ -837,14 +841,19 @@ describe("focus lifecycle", () => {
+ 			test.initial.session.refreshContext();
+ 			await test.mode.init();
+ 			submit(test.terminal, "/focus");
++			test.mode.showError("first session error");
++			expect(await screen(test.terminal)).toContain("Focus W:0 E:1");
+ 			await test.runtime.fork(forkId, { position: "at" });
+ 			let output = await screen(test.terminal);
++			expect(output).toContain("Focus W:0 E:0");
+ 			expect(output).toContain("first answer");
+ 			expect(output).not.toContain("later answer");
+ 			test.mode.showWarning("fork ordinary warning");
+ 			expect(await screen(test.terminal)).not.toContain("fork ordinary warning");
++			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
+ 			await test.runtime.newSession();
+ 			output = await screen(test.terminal);
++			expect(output).toContain("Focus W:0 E:0");
+ 			expect(output).not.toContain("first answer");
+ 			test.current().setResponses([fauxAssistantMessage("new session answer")]);
+ 			await test.runtime.session.prompt("new session user");
+@@ -852,14 +861,22 @@ describe("focus lifecycle", () => {
+ 			const selected = SessionManager.create(test.current().tempDir, test.current().tempDir);
+ 			selected.appendMessage({ role: "user", content: "selected user", timestamp: 3 });
+ 			selected.appendMessage(fauxAssistantMessage("selected answer"));
++			selected.appendMessage(fauxAssistantMessage("selected historical failure", { stopReason: "error" }));
++			test.mode.showWarning("new session warning");
++			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
+ 			await test.runtime.switchSession(selected.getSessionFile()!);
+ 			output = await screen(test.terminal);
++			expect(output).toContain("Focus W:0 E:0");
++			expect(output).not.toContain("selected historical failure");
+ 			expect(output).toContain("selected answer");
+ 			expect(output).not.toContain("new session answer");
+ 			test.mode.showWarning("selected ordinary warning");
+ 			expect(await screen(test.terminal)).not.toContain("selected ordinary warning");
++			expect(await screen(test.terminal)).toContain("Focus W:1 E:0");
+ 			submit(test.terminal, "/focus");
+ 			expect(await screen(test.terminal)).toContain("selected ordinary warning");
++			expect(await screen(test.terminal)).toContain("selected historical failure");
++			expect(await screen(test.terminal)).not.toContain("Focus W:");
+ 		} finally {
+ 			test.cleanup();
+ 		}
+diff --git a/packages/coding-agent/test/interactive-mode-focus-output.test.ts b/packages/coding-agent/test/interactive-mode-focus-output.test.ts
+index 2331ad1fc..78e7f4df0 100644
+--- a/packages/coding-agent/test/interactive-mode-focus-output.test.ts
++++ b/packages/coding-agent/test/interactive-mode-focus-output.test.ts
+@@ -851,8 +851,10 @@ describe("explicit native output in focus", () => {
+ 				submit(test.terminal, "/focus");
+ 				submit(test.terminal, command);
+ 				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain(expected));
++				expect(await screen(test.terminal)).toContain(command === "/name" ? "Focus W:1 E:0" : "Focus W:0 E:1");
+ 				test.mode.showError("background error after command");
+ 				expect(await screen(test.terminal)).not.toContain("background error after command");
++				expect(await screen(test.terminal)).toContain(command === "/name" ? "Focus W:1 E:1" : "Focus W:0 E:2");
+ 				submit(test.terminal, "/focus");
+ 				const output = await screen(test.terminal);
+ 				expect(output).toContain(expected);
+diff --git a/packages/coding-agent/test/interactive-mode-focus.test.ts b/packages/coding-agent/test/interactive-mode-focus.test.ts
+index 9eefa0550..aa85a830c 100644
+--- a/packages/coding-agent/test/interactive-mode-focus.test.ts
++++ b/packages/coding-agent/test/interactive-mode-focus.test.ts
+@@ -9,6 +9,7 @@ import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
+ import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+ import { KEYBINDINGS, KeybindingsManager } from "../src/core/keybindings.ts";
+ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import * as toolsManager from "../src/utils/tools-manager.ts";
+ import { createHarness, type Harness } from "./suite/harness.ts";
+ 
+ function createMode(harness: Harness, terminal: VirtualTerminal, tuiMode: "fullscreen" | "regular") {
+@@ -40,6 +41,315 @@ async function screen(terminal: VirtualTerminal) {
+ }
+ 
+ describe("live fullscreen focus", () => {
++	it("counts extension handler errors quietly while preserving their exact ordinary text and stack", async () => {
++		const harness = await createHarness({
++			settings: { theme: "dark", quietStartup: true, showCacheMissNotices: false },
++			extensionFactories: [
++				{
++					path: "/offline/focus-extension.ts",
++					factory: (pi) => {
++						pi.on("before_agent_start", () => {
++							const error = new Error("extension failure detail");
++							error.stack = "Error: extension failure detail\n    at offline-handler (focus-extension.ts:1:1)";
++							throw error;
++						});
++					},
++				},
++			],
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			await mode.init();
++			submit(terminal, "/focus");
++			harness.setResponses([fauxAssistantMessage("answer after extension error")]);
++			await harness.session.prompt("extension error user");
++			let output = await screen(terminal);
++			expect(output).toContain("Focus W:0 E:1");
++			expect(output).toContain("answer after extension error");
++			expect(output).not.toContain("extension failure detail");
++			expect(output).not.toContain("offline-handler");
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output).toMatch(/^ Extension "\/offline\/focus-extension.ts" error: extension failure detail\s*$/m);
++			expect(output).toMatch(/^ {3}at offline-handler \(focus-extension.ts:1:1\)\s*$/m);
++			expect(output).not.toContain("Error: extension failure detail");
++			expect(harness.faux.state.callCount).toBe(1);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
++	it("counts automatic compaction failure while keeping its unprefixed ordinary diagnostic intact", async () => {
++		const harness = await createHarness({
++			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
++			settings: {
++				theme: "dark",
++				quietStartup: true,
++				showCacheMissNotices: false,
++				retry: { enabled: false },
++				compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 },
++			},
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			await mode.init();
++			submit(terminal, "/focus");
++			harness.setResponses([
++				fauxAssistantMessage("successful answer before compaction"),
++				fauxAssistantMessage("", { stopReason: "error", errorMessage: "offline summary failure" }),
++			]);
++			await harness.session.prompt(`auto compact user ${"x".repeat(5000)}`);
++			const failure = "Context overflow recovery failed: Turn prefix summarization failed: offline summary failure";
++			expect(harness.eventsOfType("compaction_end")).toEqual([
++				expect.objectContaining({ reason: "overflow", errorMessage: failure, aborted: false }),
++			]);
++			let output = await screen(terminal);
++			expect(output).toContain("Focus W:0 E:1");
++			expect(output).toContain("successful answer before compaction");
++			expect(output).not.toContain(failure);
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output.split("\n").map((line) => line.trim())).toContain(failure);
++			expect(output).not.toContain(`Error: ${failure}`);
++			expect(harness.faux.state.callCount).toBe(2);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
++	it("counts typed managed-tool warnings but not install progress, without exposing unsolicited text", async () => {
++		// Simulate the machine's managed dependency installer through its status callback, not private UI methods.
++		const reporters: Array<NonNullable<Parameters<typeof toolsManager.ensureTool>[1]>> = [];
++		const installer = vi.spyOn(toolsManager, "ensureTool").mockImplementation(async (_tool, onStatus) => {
++			if (onStatus) reporters.push(onStatus);
++			return undefined;
++		});
++		const harness = await createHarness({
++			settings: { theme: "dark", quietStartup: true, showCacheMissNotices: false },
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			await mode.init();
++			submit(terminal, "/focus");
++			reporters[0]({ type: "info", message: "Downloading managed dependency" });
++			expect(await screen(terminal)).toContain("Focus W:0 E:0");
++			reporters[0]({ type: "warning", message: "managed dependency unavailable" });
++			reporters[1]({ type: "info", message: "Other dependency installed" });
++			let output = await screen(terminal);
++			expect(output).toContain("Focus W:1 E:0");
++			expect(output).not.toContain("managed dependency unavailable");
++			expect(output).not.toContain("Downloading managed dependency");
++			expect(output).not.toContain("Other dependency installed");
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			const ordinaryLines = output.split("\n").map((line) => line.trim());
++			expect(ordinaryLines).toContain("Downloading managed dependency");
++			expect(ordinaryLines).toContain("Warning: managed dependency unavailable");
++			expect(ordinaryLines).toContain("Other dependency installed");
++			expect(harness.faux.state.callCount).toBe(0);
++			expect(harness.session.messages).toEqual([]);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++			installer.mockRestore();
++		}
++	});
++
++	it("keeps warning-colored cache, billing and update notices informational", async () => {
++		const harness = await createHarness({
++			settings: {
++				theme: "dark",
++				quietStartup: true,
++				showCacheMissNotices: true,
++				compaction: { keepRecentTokens: 1, reserveTokens: 0 },
++			},
++			extensionFactories: [
++				(pi) => {
++					pi.on("message_end", ({ message }) => {
++						if (message.role === "assistant")
++							return {
++								message: { ...message, usage: { ...message.usage, input: 30000, cacheRead: 0, cacheWrite: 0 } },
++							};
++					});
++					pi.on("session_before_compact", ({ preparation }) => ({
++						compaction: {
++							summary: "offline billing summary",
++							firstKeptEntryId: preparation.firstKeptEntryId,
++							tokensBefore: preparation.tokensBefore,
++							usage: { ...fauxAssistantMessage("usage").usage, input: 1234 },
++						},
++					}));
++				},
++			],
++		});
++		const terminal = new VirtualTerminal(120, 60);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			harness.sessionManager.appendMessage({ role: "user", content: "cached user", timestamp: 1 });
++			const cached = fauxAssistantMessage("cached answer");
++			cached.usage = { ...cached.usage, cacheWrite: 30000, totalTokens: 30000 };
++			harness.sessionManager.appendMessage(cached);
++			harness.session.refreshContext();
++			await mode.init();
++			submit(terminal, "/focus");
++			mode.showNewVersionNotification({ version: "99.0.0" });
++			mode.showPackageUpdateNotification(["offline-package"]);
++			harness.setResponses([fauxAssistantMessage("answer with cache miss")]);
++			await harness.session.prompt("cache miss user");
++			let output = await screen(terminal);
++			expect(output).toContain("Focus W:0 E:0");
++			for (const text of ["Cache miss:", "Update Available", "Package Updates Available"])
++				expect(output).not.toContain(text);
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			for (const text of ["Cache miss: 30k tokens re-billed", "Update Available", "Package Updates Available"])
++				expect(output).toContain(text);
++			submit(terminal, "/focus");
++			await harness.session.compact();
++			expect(await screen(terminal)).toContain("Focus W:0 E:0");
++			expect(await screen(terminal)).not.toContain("Compaction: 1.2k tokens billed");
++			submit(terminal, "/focus");
++			expect(await screen(terminal)).toContain("Compaction: 1.2k tokens billed");
++			expect(harness.faux.state.callCount).toBe(1);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
++	it("reports live diagnostics quietly beside extension statuses and reveals their details on leaving focus", async () => {
++		const harness = await createHarness({
++			settings: { theme: "dark", quietStartup: true, showCacheMissNotices: false },
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_start", (_event, ctx) => {
++						ctx.ui.setStatus("codex", "Cdx");
++						ctx.ui.setStatus("other", "other status");
++					});
++				},
++			],
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			await mode.init();
++			mode.showError("before focus");
++			submit(terminal, "/focus");
++			expect(await screen(terminal)).toContain("Focus W:0 E:0");
++			mode.showWarning("live warning detail");
++			mode.showError("live error detail");
++			const output = await screen(terminal);
++			const statusLine = output.split("\n").find((line) => line.includes("Cdx"))!;
++			expect(statusLine).toMatch(/^Cdx other status +Focus W:1 E:1$/);
++			for (const text of ["before focus", "live warning detail", "live error detail"])
++				expect(output).not.toContain(text);
++			submit(terminal, "/focus");
++			const ordinary = await screen(terminal);
++			for (const text of ["before focus", "live warning detail", "live error detail"])
++				expect(ordinary).toContain(text);
++			expect(ordinary).not.toContain("Focus W:");
++			expect(harness.faux.state.callCount).toBe(0);
++			expect(harness.session.messages).toEqual([]);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++	it.each([
++		["error", "Focus W:0 E:1"],
++		["aborted", "Focus W:0 E:1"],
++		["length", "Focus W:1 E:0"],
++	] as const)("counts a live %s completion without exposing its unfinished answer", async (stopReason, status) => {
++		const harness = await createHarness({
++			settings: { theme: "dark", quietStartup: true, retry: { enabled: false }, showCacheMissNotices: false },
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			harness.sessionManager.appendMessage(fauxAssistantMessage("historical failure", { stopReason: "error" }));
++			harness.session.refreshContext();
++			await mode.init();
++			submit(terminal, "/focus");
++			expect(await screen(terminal)).toContain("Focus W:0 E:0");
++			harness.setResponses([
++				fauxAssistantMessage("unfinished answer", { stopReason, errorMessage: "provider detail" }),
++			]);
++			await harness.session.prompt("first turn");
++			let output = await screen(terminal);
++			expect(output).toContain(status);
++			expect(output).not.toContain("unfinished answer");
++			expect(output).not.toContain("provider detail");
++			harness.setResponses([fauxAssistantMessage("next successful answer")]);
++			await harness.session.prompt("next turn");
++			expect(await screen(terminal)).toContain(status);
++			const records = structuredClone(harness.sessionManager.getEntries());
++			const context = structuredClone(harness.session.messages);
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output).toContain("unfinished answer");
++			expect(output).toContain("historical failure");
++			submit(terminal, "/focus");
++			expect(await screen(terminal)).toContain("Focus W:0 E:0");
++			expect(harness.faux.state.callCount).toBe(2);
++			expect(harness.sessionManager.getEntries()).toEqual(records);
++			expect(harness.session.messages).toEqual(context);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
++	it("excludes agent tool failures, warning-colored tool output and routine notices from diagnostic counts", async () => {
++		const tool: AgentTool = {
++			name: "fail",
++			label: "Fail",
++			description: "Offline failure",
++			parameters: Type.Object({}),
++			execute: async (_id, _args, _signal, onUpdate) => {
++				onUpdate?.({ content: [{ type: "text", text: "\x1b[33mWarning: tool progress\x1b[0m" }], details: {} });
++				throw new Error("intermediate tool failure");
++			},
++		};
++		const harness = await createHarness({
++			tools: [tool],
++			settings: { theme: "dark", quietStartup: true, showCacheMissNotices: false },
++			extensionFactories: [
++				(pi) => {
++					pi.on("before_agent_start", (_event, ctx) => ctx.ui.notify("routine info"));
++				},
++			],
++		});
++		const terminal = new VirtualTerminal(120, 50);
++		const mode = createMode(harness, terminal, "fullscreen");
++		try {
++			await mode.init();
++			submit(terminal, "/focus");
++			harness.setResponses([
++				fauxAssistantMessage([fauxToolCall("fail", {})], { stopReason: "toolUse" }),
++				fauxAssistantMessage("recovered tool answer"),
++			]);
++			await harness.session.prompt("tool user");
++			let output = await screen(terminal);
++			expect(output).toContain("Focus W:0 E:0");
++			expect(output).toContain("recovered tool answer");
++			expect(output).not.toContain("intermediate tool failure");
++			expect(output).not.toContain("routine info");
++			submit(terminal, "/focus");
++			output = await screen(terminal);
++			expect(output).toContain("intermediate tool failure");
++			expect(output).toContain("routine info");
++			expect(harness.faux.state.callCount).toBe(2);
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++		}
++	});
++
+ 	it("leaves the focus action unbound and editor defaults unchanged", () => {
+ 		const keys = new KeybindingsManager();
+ 		expect(keys.getKeys("app.transcript.toggleFinalOnly")).toEqual([]);
+diff --git a/packages/coding-agent/test/interactive-mode-status.test.ts b/packages/coding-agent/test/interactive-mode-status.test.ts
+index 8a54d6fa9..24c9b02ed 100644
+--- a/packages/coding-agent/test/interactive-mode-status.test.ts
++++ b/packages/coding-agent/test/interactive-mode-status.test.ts
+@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
+ import { type Component, Container, type Focusable, type TUI } from "../../tui/src/tui.ts";
+ import { TuiMainScreen } from "../../tui/src/tui-main-screen.ts";
+ import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+ import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
+ import type { QuietStartup } from "../src/core/settings-manager.ts";
+ import type { SourceInfo } from "../src/core/source-info.ts";
+@@ -12,6 +13,8 @@ import type { AuthSelectorProvider } from "../src/modes/interactive/components/o
+ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+ import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
+ import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
++import * as toolsManager from "../src/utils/tools-manager.ts";
++import { createHarness } from "./suite/harness.ts";
+ 
+ function renderLastLine(container: Container, width = 120): string {
+ 	const last = container.children[container.children.length - 1];
+@@ -143,24 +146,42 @@ describe("InteractiveMode.showStatus", () => {
+ describe("InteractiveMode.showManagedToolStatus", () => {
+ 	beforeAll(() => initTheme("dark"));
+ 
+-	test("renders tool updates as one contiguous group", () => {
+-		const fakeThis: any = {
+-			chatContainer: new Container(),
+-			ui: { requestRender: vi.fn() },
+-			managedToolStatusStarted: false,
+-			lastStatusSpacer: undefined,
+-			lastStatusText: undefined,
+-		};
+-		const showManagedToolStatus = (InteractiveMode as any).prototype.showManagedToolStatus;
+-
+-		showManagedToolStatus.call(fakeThis, { type: "info", message: "fd downloading" });
+-		showManagedToolStatus.call(fakeThis, { type: "info", message: "rg downloading" });
+-		showManagedToolStatus.call(fakeThis, { type: "warning", message: "rg failed" });
+-
+-		expect(fakeThis.chatContainer.children).toHaveLength(4);
+-		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toBe(
+-			"fd downloading\n rg downloading\n Warning: rg failed",
++	test("renders tool updates as one contiguous group", async () => {
++		const installer = vi.spyOn(toolsManager, "ensureTool").mockImplementation(async (tool, onStatus) => {
++			onStatus?.({ type: "info", message: `${tool} downloading` });
++			if (tool === "rg") onStatus?.({ type: "warning", message: "rg failed" });
++			return undefined;
++		});
++		const harness = await createHarness({ settings: { theme: "dark", quietStartup: true } });
++		const terminal = new VirtualTerminal(120, 60);
++		const runtime = new AgentSessionRuntime(
++			harness.session,
++			{
++				cwd: harness.tempDir,
++				agentDir: harness.tempDir,
++				modelRuntime: harness.session.modelRuntime,
++				settingsManager: harness.settingsManager,
++				resourceLoader: harness.session.resourceLoader,
++				diagnostics: [],
++			},
++			async () => {
++				throw new Error("Session replacement is outside this managed-tool scenario");
++			},
+ 		);
++		const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
++		try {
++			await mode.init();
++			await terminal.waitForRender();
++			const output = terminal
++				.getViewport()
++				.map((line) => line.trimEnd())
++				.join("\n");
++			expect(output).toContain(" fd downloading\n rg downloading\n Warning: rg failed");
++		} finally {
++			mode.stop("resume-hint");
++			harness.cleanup();
++			installer.mockRestore();
++		}
+ 	});
+ });
+ 
+diff --git a/packages/coding-agent/test/transcript-presentation.test.ts b/packages/coding-agent/test/transcript-presentation.test.ts
+index 691b275ff..b031bb77c 100644
+--- a/packages/coding-agent/test/transcript-presentation.test.ts
++++ b/packages/coding-agent/test/transcript-presentation.test.ts
+@@ -191,6 +191,46 @@ describe("transcript presentation", () => {
+ 		expect(presentation.document.render(80).join("\n")).toContain("new session user");
+ 	});
+ 
++	it("retains live counts through turns and reconciliation, but resets their interval on toggles and session changes", () => {
++		const presentation = new TranscriptPresentation({
++			header: new Text("header", 0, 0),
++			resources: new Text("resources", 0, 0),
++			transcript: pendingOutput("ordinary diagnostic details"),
++			pendingOutput: pendingOutput("pending"),
++			getMarkdownTheme,
++			getOutputPad: () => 1,
++			getMarkdownTransformers: () => [],
++		});
++		const historical = fauxAssistantMessage("historical failure", { stopReason: "error" });
++		presentation.replaceHistory([historical]);
++		presentation.reportDiagnostic("warning");
++		presentation.messageEnded(fauxAssistantMessage("ordinary failure", { stopReason: "aborted" }));
++		expect(presentation.getStatus()).toBeUndefined();
++		presentation.toggleFocus();
++		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
++		presentation.reportDiagnostic("warning");
++		const failed = fauxAssistantMessage("live failure", { stopReason: "error" });
++		presentation.messageEnded(failed);
++		presentation.messageStarted({ role: "user", content: "next turn", timestamp: 1 });
++		presentation.messageEnded(fauxAssistantMessage("next completed answer"));
++		expect(presentation.getStatus()).toBe("Focus W:1 E:1");
++		presentation.replaceHistory([historical, failed]);
++		presentation.refreshConversation();
++		presentation.refreshConversation();
++		expect(presentation.getStatus()).toBe("Focus W:1 E:1");
++		expect(presentation.document.render(80).join("\n")).not.toContain("failure");
++		presentation.toggleFocus();
++		expect(presentation.getStatus()).toBeUndefined();
++		expect(presentation.document.render(80).join("\n")).toContain("ordinary diagnostic details");
++		presentation.toggleFocus();
++		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
++		presentation.reportDiagnostic("error");
++		presentation.resetSession();
++		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
++		presentation.replaceHistory([historical]);
++		expect(presentation.getStatus()).toBe("Focus W:0 E:0");
++	});
++
+ 	it("does not present a deferred answer as completed even if it has a stop reason", () => {
+ 		const presentation = new TranscriptPresentation({
+ 			header: new Text("header", 0, 0),
+-- 
+2.47.3
+

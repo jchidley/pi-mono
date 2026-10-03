@@ -1,0 +1,352 @@
+From ce541449a418ecd02ddcf49875bc729cbee4f8c5 Mon Sep 17 00:00:00 2001
+From: Jack Chidley <7399749+jchidley@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 10:21:24 +0100
+Subject: [PATCH 1/6] feat(coding-agent): establish transcript presentation
+ boundary
+
+---
+ .../src/modes/interactive/interactive-mode.ts |  21 ++-
+ .../interactive/transcript-presentation.ts    |  28 ++++
+ .../interactive-mode-presentation.test.ts     | 157 ++++++++++++++++++
+ packages/coding-agent/test/suite/harness.ts   |   4 +
+ .../test/transcript-presentation.test.ts      |  39 +++++
+ 5 files changed, 240 insertions(+), 9 deletions(-)
+ create mode 100644 packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+ create mode 100644 packages/coding-agent/test/interactive-mode-presentation.test.ts
+ create mode 100644 packages/coding-agent/test/transcript-presentation.test.ts
+
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 158f59e5f..32106e6e4 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -199,6 +199,7 @@ import {
+ 	theme,
+ } from "./theme/theme.ts";
+ import { InteractiveThemeController } from "./theme/theme-controller.ts";
++import { TranscriptPresentation } from "./transcript-presentation.ts";
+ import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
+ 
+ export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
+@@ -451,7 +452,7 @@ export class InteractiveMode {
+ 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
+ 	private loadedResourcesContainer: Container;
+ 	private chatContainer: Container;
+-	private documentContainer: Container;
++	private transcriptPresentation: TranscriptPresentation;
+ 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
+ 	private fullscreenLayoutRoot: Component | undefined;
+ 	private pendingMessagesContainer: Container;
+@@ -622,11 +623,13 @@ export class InteractiveMode {
+ 		this.headerContainer = new Container();
+ 		this.loadedResourcesContainer = new Container();
+ 		this.chatContainer = new Container();
+-		this.documentContainer = new Container();
+-		this.documentContainer.addChild(this.headerContainer);
+-		this.documentContainer.addChild(this.loadedResourcesContainer);
+-		this.documentContainer.addChild(this.chatContainer);
+ 		this.pendingMessagesContainer = new Container();
++		this.transcriptPresentation = new TranscriptPresentation({
++			header: this.headerContainer,
++			resources: this.loadedResourcesContainer,
++			transcript: this.chatContainer,
++			pendingOutput: this.pendingMessagesContainer,
++		});
+ 		this.statusContainer = new Container();
+ 		this.widgetContainerAbove = new Container();
+ 		this.widgetContainerBelow = new Container();
+@@ -955,8 +958,8 @@ export class InteractiveMode {
+ 		// Keep one component tree and remount it when changing renderers.
+ 		this.renderWidgets(); // Initialize with default spacer
+ 		const viewport = createChatViewport({
+-			document: this.documentContainer,
+-			pendingMessages: this.pendingMessagesContainer,
++			document: this.transcriptPresentation.document,
++			pendingMessages: this.transcriptPresentation.pendingOutput,
+ 			status: this.statusContainer,
+ 			widgetsAbove: this.widgetContainerAbove,
+ 			editor: this.editorContainer,
+@@ -969,8 +972,8 @@ export class InteractiveMode {
+ 		this.transcriptScrollView = viewport.transcript;
+ 		this.fullscreenLayoutRoot = viewport.root;
+ 		this.mountInteractiveTui(this.renderer, [
+-			this.documentContainer,
+-			this.pendingMessagesContainer,
++			this.transcriptPresentation.document,
++			this.transcriptPresentation.pendingOutput,
+ 			this.statusContainer,
+ 			this.widgetContainerAbove,
+ 			this.editorContainer,
+diff --git a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+new file mode 100644
+index 000000000..a0b92b315
+--- /dev/null
++++ b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+@@ -0,0 +1,28 @@
++import { type Component, Container } from "@earendil-works/pi-tui";
++
++export interface TranscriptPresentationOptions {
++	readonly header: Component;
++	readonly resources: Component;
++	readonly transcript: Component;
++	readonly pendingOutput: Component;
++}
++
++/**
++ * Owns transcript document composition, independently of the renderer and input dock.
++ * The host supplies the ordinary live component graph and keeps updating it through
++ * session events and native commands. Mount these surfaces in either native renderer;
++ * do not reconstruct messages or mix the pending dock into the scrollable document.
++ */
++export class TranscriptPresentation {
++	readonly document: Component;
++	readonly pendingOutput: Component;
++
++	constructor(options: TranscriptPresentationOptions) {
++		const document = new Container();
++		document.addChild(options.header);
++		document.addChild(options.resources);
++		document.addChild(options.transcript);
++		this.document = document;
++		this.pendingOutput = options.pendingOutput;
++	}
++}
+diff --git a/packages/coding-agent/test/interactive-mode-presentation.test.ts b/packages/coding-agent/test/interactive-mode-presentation.test.ts
+new file mode 100644
+index 000000000..8b48f8825
+--- /dev/null
++++ b/packages/coding-agent/test/interactive-mode-presentation.test.ts
+@@ -0,0 +1,157 @@
++import type { AgentTool } from "@earendil-works/pi-agent-core";
++import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
++import { Text } from "@earendil-works/pi-tui";
++import { Type } from "typebox";
++import { describe, expect, it, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { createHarness } from "./suite/harness.ts";
++
++describe("InteractiveMode ordinary presentation", () => {
++	it.each(["regular", "fullscreen"] as const)(
++		"keeps live messages, tools, commands, diagnostics and surrounding controls visible in %s mode",
++		async (tuiMode) => {
++			const tool: AgentTool = {
++				name: "echo",
++				label: "Echo",
++				description: "Offline echo",
++				parameters: Type.Object({}),
++				execute: async (_id, _args, _signal, onUpdate) => {
++					onUpdate?.({ content: [{ type: "text", text: "tool partial" }], details: {} });
++					return { content: [{ type: "text", text: "tool finished" }], details: {} };
++				},
++			};
++			const harness = await createHarness({
++				tools: [tool],
++				fauxStreaming: { tokensPerSecond: 40, tokenSize: { min: 1, max: 1 } },
++				settings: { theme: "dark", showCacheMissNotices: false },
++				extensionFactories: [
++					(pi) => {
++						pi.on("session_start", (_event, ctx) => {
++							ctx.ui.setHeader(() => new Text("presentation header", 0, 0));
++							ctx.ui.setWidget("above", ["above editor"]);
++							ctx.ui.setWidget("below", ["below editor"], { placement: "belowEditor" });
++							ctx.ui.setStatus("test", "presentation status");
++						});
++					},
++				],
++			});
++			const terminal = new VirtualTerminal(120, 60);
++			const runtime = new AgentSessionRuntime(
++				harness.session,
++				{
++					cwd: harness.tempDir,
++					agentDir: harness.tempDir,
++					modelRuntime: harness.session.modelRuntime,
++					settingsManager: harness.settingsManager,
++					resourceLoader: harness.session.resourceLoader,
++					diagnostics: [],
++				},
++				async () => {
++					throw new Error("Session replacement is outside this presentation scenario");
++				},
++			);
++			const mode = new InteractiveMode(runtime, { tuiMode, terminal });
++			const frames: string[] = [];
++			const firstAssistantFrames: string[] = [];
++			let firstAssistantEnded = false;
++			const eventTypes: string[] = [];
++			let unsubscribe = () => {};
++			let checkedPendingDock = false;
++			try {
++				await mode.init();
++				unsubscribe = harness.session.agent.subscribe(async (event) => {
++					if (event.type === "message_end" && event.message.role === "assistant") {
++						firstAssistantEnded = true;
++					}
++					if (event.type === "message_update" && !checkedPendingDock) {
++						checkedPendingDock = true;
++						terminal.sendInput("\x1b[200~!!printf 'pending bash %s\\n' visible\x1b[201~");
++						terminal.sendInput("\r");
++						await vi.waitFor(async () => {
++							await terminal.waitForRender();
++							expect(terminal.getViewport().join("\n")).toMatch(/^\s*pending bash visible\s*$/m);
++							expect(harness.session.isBashRunning).toBe(false);
++						});
++						await harness.session.steer("queued steering");
++						await harness.session.followUp("queued follow-up");
++						await terminal.waitForRender();
++						const dock = terminal.getViewport().join("\n");
++						expect(dock).toContain("Steering: queued steering");
++						expect(dock).toContain("Follow-up: queued follow-up");
++						expect(dock).toContain("to edit all queued messages");
++						expect(dock).toContain("Working");
++					}
++					if (event.type === "message_update" || event.type.startsWith("tool_execution_")) {
++						await terminal.waitForRender();
++						const frame = terminal.getViewport().join("\n");
++						frames.push(frame);
++						if (
++							event.type === "message_update" &&
++							event.assistantMessageEvent.type === "text_delta" &&
++							!firstAssistantEnded
++						) {
++							firstAssistantFrames.push(frame);
++						}
++						eventTypes.push(event.type);
++					}
++				});
++				const streamedAnswer = "assistant streaming starts, keeps growing, and finishes";
++				harness.setResponses([
++					fauxAssistantMessage([{ type: "text", text: streamedAnswer }, fauxToolCall("echo", {})], {
++						stopReason: "toolUse",
++					}),
++					fauxAssistantMessage("assistant final"),
++					fauxAssistantMessage("follow-up final"),
++				]);
++				await harness.session.prompt("user message");
++				await terminal.waitForRender();
++				const conversation = terminal.getViewport().join("\n");
++				// Require visible growth while this same answer is unfinished, not a particular chunk boundary.
++				const partialAnswers = [
++					...new Set(
++						firstAssistantFrames.flatMap((frame) => {
++							const answer = frame.match(/^[ \t]*(assistant streaming[^\n]*)$/m)?.[1].trimEnd();
++							return answer && answer !== streamedAnswer ? [answer] : [];
++						}),
++					),
++				];
++				expect(partialAnswers.length).toBeGreaterThanOrEqual(2);
++				expect(partialAnswers[1].length).toBeGreaterThan(partialAnswers[0].length);
++				expect(eventTypes).toContain("tool_execution_update");
++				expect(frames.some((frame) => frame.includes("tool partial") && !frame.includes("tool finished"))).toBe(
++					true,
++				);
++				expect(conversation).toMatch(
++					/user message[\s\S]*assistant streaming[\s\S]*tool finished[\s\S]*assistant final/,
++				);
++
++				terminal.sendInput("\x1b[200~/name presentation-test\x1b[201~");
++				terminal.sendInput("\r");
++				mode.showWarning("presentation warning");
++				mode.showError("presentation error");
++				terminal.sendInput("\x1b[200~!printf 'manual bash %s\\n' visible\x1b[201~");
++				terminal.sendInput("\r");
++				await vi.waitFor(async () => {
++					await terminal.waitForRender();
++					expect(terminal.getViewport().join("\n")).toMatch(/^\s*manual bash visible\s*$/m);
++					expect(harness.session.isBashRunning).toBe(false);
++				});
++				const output = terminal.getViewport().join("\n");
++				expect(output).toMatch(
++					/Session name set: presentation-test[\s\S]*Warning: presentation warning[\s\S]*Error: presentation error[\s\S]*manual bash visible/,
++				);
++				expect(output).toMatch(
++					/presentation header[\s\S]*user message[\s\S]*above editor[\s\S]*below editor[\s\S]*presentation status/,
++				);
++				expect(output).toContain("faux-1");
++				expect(harness.faux.state.callCount).toBe(3);
++			} finally {
++				unsubscribe();
++				mode.stop("resume-hint");
++				harness.cleanup();
++			}
++		},
++	);
++});
+diff --git a/packages/coding-agent/test/suite/harness.ts b/packages/coding-agent/test/suite/harness.ts
+index 220a1558f..6e37f28b8 100644
+--- a/packages/coding-agent/test/suite/harness.ts
++++ b/packages/coding-agent/test/suite/harness.ts
+@@ -13,6 +13,7 @@ import type {
+ 	FauxProviderRegistration,
+ 	FauxResponseStep,
+ 	Model,
++	RegisterFauxProviderOptions,
+ 	ToolResultMessage,
+ } from "@earendil-works/pi-ai/compat";
+ import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+@@ -110,6 +111,8 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
+ 
+ export interface HarnessOptions {
+ 	models?: FauxModelDefinition[];
++	/** Controlled chunking for tests that observe output before message completion. */
++	fauxStreaming?: Pick<RegisterFauxProviderOptions, "tokensPerSecond" | "tokenSize">;
+ 	settings?: Partial<Settings>;
+ 	tools?: AgentTool[];
+ 	initialActiveToolNames?: string[];
+@@ -151,6 +154,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
+ 	const tempDir = createTempDir();
+ 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+ 		models: options.models,
++		...options.fauxStreaming,
+ 	});
+ 	fauxProvider.setResponses([]);
+ 	const model = fauxProvider.getModel();
+diff --git a/packages/coding-agent/test/transcript-presentation.test.ts b/packages/coding-agent/test/transcript-presentation.test.ts
+new file mode 100644
+index 000000000..0c43e0c99
+--- /dev/null
++++ b/packages/coding-agent/test/transcript-presentation.test.ts
+@@ -0,0 +1,39 @@
++import { Container, Text } from "@earendil-works/pi-tui";
++import { describe, expect, it } from "vitest";
++import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
++
++describe("ordinary transcript presentation", () => {
++	it("presents header, resources and live transcript in order, with pending output on its own surface", () => {
++		const transcript = new Container();
++		const assistant = new Text("assistant: starting", 0, 0);
++		transcript.addChild(new Text("user: hello", 0, 0));
++		transcript.addChild(assistant);
++		const pending = new Text("pending bash: running", 0, 0);
++		const presentation = new TranscriptPresentation({
++			header: new Text("header", 0, 0),
++			resources: new Text("loaded resources", 0, 0),
++			transcript,
++			pendingOutput: pending,
++		});
++
++		expect(presentation.document.render(80).map((line) => line.trimEnd())).toEqual([
++			"header",
++			"loaded resources",
++			"user: hello",
++			"assistant: starting",
++		]);
++		expect(presentation.pendingOutput.render(80).map((line) => line.trimEnd())).toEqual(["pending bash: running"]);
++
++		assistant.setText("assistant: complete");
++		transcript.addChild(new Text("tool: complete", 0, 0));
++		pending.setText("pending bash: complete");
++		expect(presentation.document.render(80).map((line) => line.trimEnd())).toEqual([
++			"header",
++			"loaded resources",
++			"user: hello",
++			"assistant: complete",
++			"tool: complete",
++		]);
++		expect(presentation.pendingOutput.render(80).map((line) => line.trimEnd())).toEqual(["pending bash: complete"]);
++	});
++});
+-- 
+2.47.3
+

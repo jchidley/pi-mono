@@ -1,0 +1,138 @@
+
+ RUN  v4.1.11 /home/jack/git/pi-mono/packages/coding-agent
+
+xxxxxxxxx
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 9 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!' output ordered and live through 'manual' compaction (focus=false)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!!' output ordered and live through 'manual' compaction (focus=false)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!' output ordered and live through 'manual' compaction (focus=true)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!!' output ordered and live through 'manual' compaction (focus=true)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!' output ordered and live through 'boundary' compaction (focus=false)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!!' output ordered and live through 'boundary' compaction (focus=false)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!' output ordered and live through 'boundary' compaction (focus=true)
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > keeps active idle '!!' output ordered and live through 'boundary' compaction (focus=true)
+AssertionError: expected [] to have a length of 1 but got +0
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ expectChunk test/interactive-mode-focus-upgrade.test.ts:66:69
+     64|
+     65| function expectChunk(output: string, chunk: string) {
+     66|  expect(output.split("\n").filter((line) => line.trim() === chunk)).to…
+       |                                                                     ^
+     67|  expect(output.indexOf(chunk)).toBeLessThan(output.indexOf("retained l…
+     68| }
+ ❯ test/interactive-mode-focus-upgrade.test.ts:147:6
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/9]⎯
+
+ FAIL  test/interactive-mode-focus-upgrade.test.ts > Focus upgrade regressions > counts genuinely new reload loading errors quietly, not startup failures or unchanged reloads
+AssertionError: expected '\n Reloaded keybindings, extensions, …' to contain 'Focus W:0 E:1'
+
+- Expected
++ Received
+
+- Focus W:0 E:1
++
++  Reloaded keybindings, extensions, skills, prompts, themes, and context files                                           
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
++                                                                                                                         
++ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
++ ~/git/pi-mono/packages/coding-agent (stock/pi-1.0.0)
++ 0.0%/128k (auto)                                                                                           (faux) faux-1
++ loading finished 1                                                                                         Focus W:0 E:0
+
+ ❯ test/interactive-mode-focus-upgrade.test.ts:226:19
+    224|    expect(output).not.toContain("new reload load failure");
+    225|    expect(output).not.toContain("historical startup load failure");
+    226|    expect(output).toContain("Focus W:0 E:1");
+       |                   ^
+    227|    await test.runtime.session.prompt("/refresh-theme");
+    228|    test.terminal.resize(100, 80);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/9]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  9 failed (9)
+   Start at  16:48:34
+   Duration  10.03s (transform 5.38s, setup 0ms, import 7.52s, tests 2.29s, environment 0ms)
+

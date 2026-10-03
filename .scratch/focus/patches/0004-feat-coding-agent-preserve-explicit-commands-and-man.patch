@@ -1,0 +1,3559 @@
+From 5b317b6be5ca94c7938d78d8c47191ab58674275 Mon Sep 17 00:00:00 2001
+From: Jack Chidley <7399749+jchidley@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 22:17:50 +0100
+Subject: [PATCH 4/6] feat(coding-agent): preserve explicit commands and manual
+ bash in focus
+
+---
+ .../src/modes/interactive/interactive-mode.ts | 555 ++++++----
+ .../interactive/transcript-presentation.ts    |  76 +-
+ .../interactive-mode-clone-command.test.ts    |   4 +-
+ .../test/interactive-mode-compaction.test.ts  |  56 +-
+ .../interactive-mode-focus-lifecycle.test.ts  | 386 +++++++
+ .../interactive-mode-focus-output.test.ts     | 963 ++++++++++++++++++
+ .../interactive-mode-import-command.test.ts   |   9 +-
+ .../interactive-mode-startup-input.test.ts    |   5 +-
+ .../test/interactive-mode-status.test.ts      |  33 +-
+ .../test/interactive-mode-suspend.test.ts     |   2 +-
+ .../interactive-mode-tree-navigation.test.ts  |   4 +-
+ .../coding-agent/test/interactive-tui.test.ts |   2 +-
+ ...hinking-toggle-pending-tool-render.test.ts |   5 +
+ .../7027-credential-refresh-hang.test.ts      |   9 +-
+ .../7443-model-command-cached-match.test.ts   |   2 +-
+ .../7829-invalid-settings-warning.test.ts     |  12 +-
+ .../9068-user-bash-fail-closed.test.ts        |  17 +-
+ .../test/transcript-presentation.test.ts      |  10 +-
+ 18 files changed, 1902 insertions(+), 248 deletions(-)
+ create mode 100644 packages/coding-agent/test/interactive-mode-focus-output.test.ts
+
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 3424af6ea..0059164fb 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -199,7 +199,7 @@ import {
+ 	theme,
+ } from "./theme/theme.ts";
+ import { InteractiveThemeController } from "./theme/theme-controller.ts";
+-import { TranscriptPresentation } from "./transcript-presentation.ts";
++import { type TranscriptOutputIntent, TranscriptPresentation } from "./transcript-presentation.ts";
+ import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
+ 
+ export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
+@@ -272,6 +272,7 @@ type CompactionCostNotice = {
+ 	type: "compaction_cost";
+ 	kind: "compaction" | "branch_summary";
+ 	usage: Usage;
++	intent?: TranscriptOutputIntent;
+ };
+ 
+ type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" | "usage" }> | CompactionCostNotice;
+@@ -447,6 +448,8 @@ export interface InteractiveModeOptions {
+ 
+ export class InteractiveMode {
+ 	private runtimeHost: AgentSessionRuntime;
++	private extensionErrorSession: AgentSession | undefined;
++	private sessionInvalidated = false;
+ 	private renderer: TuiMainScreen | TuiAltScreen;
+ 	private ui: TUI;
+ 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
+@@ -494,7 +497,8 @@ export class InteractiveMode {
+ 	// Status line tracking (for mutating immediately-sequential status updates)
+ 	private lastStatusSpacer: Spacer | undefined = undefined;
+ 	private lastStatusText: ThemedText | undefined = undefined;
+-	private lastStatusMessage = "";
++	private lastStatusMessage = { text: "" };
++	private lastStatusIntent: TranscriptOutputIntent = "background";
+ 	private managedToolStatusStarted = false;
+ 
+ 	// Streaming message tracking
+@@ -528,9 +532,14 @@ export class InteractiveMode {
+ 
+ 	// Track current bash execution component
+ 	private bashComponent: BashExecutionComponent | undefined = undefined;
++	// Cover asynchronous user_bash interception before the session starts local execution.
++	private bashCommandPending: symbol | undefined;
+ 
+ 	// Track pending bash components (shown in pending area, moved to chat on submit)
+-	private pendingBashComponents: BashExecutionComponent[] = [];
++	private pendingBashComponents = new Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">();
++
++	// Presentation ownership of native /compact invocations, not extension-triggered compaction.
++	private explicitCompactions = 0;
+ 
+ 	// Auto-compaction state
+ 	private autoCompactionEscapeHandler?: () => void;
+@@ -602,15 +611,22 @@ export class InteractiveMode {
+ 		this.options = { ...options, tuiMode };
+ 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
+ 		this.runtimeHost.setBeforeSessionInvalidate(() => {
++			this.sessionInvalidated = true;
++			this.extensionErrorSession = undefined;
++			this.bashCommandPending = undefined;
+ 			this.resetExtensionUI();
+ 			this.transcriptPresentation.resetSession();
+-			this.pendingBashComponents = [];
++			this.pendingBashComponents.clear();
++			this.bashComponent?.setComplete(undefined, true);
+ 			this.bashComponent = undefined;
+ 			this.entriesRenderedByBoundaryCompaction.clear();
+ 		});
+ 		this.runtimeHost.setRebindSession(async () => {
++			const session = this.session;
+ 			await this.rebindCurrentSession({ renderBeforeBind: true });
++			if (this.session !== session || this.extensionErrorSession !== session) return;
+ 			this.themeController.applyFromSettings();
++			this.sessionInvalidated = false;
+ 		});
+ 		this.version = VERSION;
+ 		this.renderer = createInteractiveTui({
+@@ -1970,8 +1986,10 @@ export class InteractiveMode {
+ 	 * Initialize the extension system with TUI-based UI context.
+ 	 */
+ 	private async bindCurrentSessionExtensions(): Promise<void> {
++		const session = this.session;
++		this.extensionErrorSession = session;
+ 		const uiContext = this.createExtensionUIContext();
+-		await this.session.bindExtensions({
++		await session.bindExtensions({
+ 			uiContext,
+ 			mode: "tui",
+ 			abortHandler: () => {
+@@ -2033,6 +2051,7 @@ export class InteractiveMode {
+ 				}
+ 			},
+ 			onError: (error) => {
++				if (this.extensionErrorSession !== session) return;
+ 				this.showExtensionError(error.extensionPath, error.error, error.stack);
+ 			},
+ 		});
+@@ -3150,7 +3169,7 @@ export class InteractiveMode {
+ 
+ 	private handleStartupSubmit(text: string): void {
+ 		this.editor.setText(text);
+-		this.showStatus("Startup is still in progress");
++		this.showStatus("Startup is still in progress", "explicit");
+ 	}
+ 
+ 	private setupEditorSubmitHandler(): void {
+@@ -3274,7 +3293,7 @@ export class InteractiveMode {
+ 			}
+ 			if (text === "/reload") {
+ 				this.editor.setText("");
+-				await this.handleReloadCommand();
++				await this.handleReloadCommand("explicit");
+ 				return;
+ 			}
+ 			if (text === "/debug") {
+@@ -3308,15 +3327,31 @@ export class InteractiveMode {
+ 				const isExcluded = text.startsWith("!!");
+ 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+ 				if (command) {
+-					if (this.session.isBashRunning) {
+-						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
++					if (this.sessionInvalidated) {
++						this.showWarning(
++							"Session replacement is still in progress. Retry this command after it finishes.",
++							"explicit",
++						);
++						this.editor.setText(text);
++						return;
++					}
++					if (this.session.isBashRunning || this.bashCommandPending) {
++						this.showWarning("A bash command is already running. Press Esc to cancel it first.", "explicit");
+ 						this.editor.setText(text);
+ 						return;
+ 					}
+ 					this.editor.addToHistory?.(text);
+-					await this.handleBashCommand(command, isExcluded);
+-					this.isBashMode = false;
+-					this.updateEditorBorderColor();
++					const reservation = Symbol("manual bash");
++					this.bashCommandPending = reservation;
++					try {
++						await this.handleBashCommand(command, isExcluded, reservation);
++					} finally {
++						if (this.bashCommandPending === reservation) {
++							this.bashCommandPending = undefined;
++							this.isBashMode = false;
++							this.updateEditorBorderColor();
++						}
++					}
+ 					return;
+ 				}
+ 			}
+@@ -3477,6 +3512,7 @@ export class InteractiveMode {
+ 					);
+ 					this.streamingMessage = event.message;
+ 					this.chatContainer.addChild(this.streamingComponent);
++					this.transcriptPresentation.messagePresented(event.message, this.streamingComponent);
+ 					this.streamingComponent.updateContent(this.streamingMessage, true);
+ 					this.ui.requestRender();
+ 				}
+@@ -3521,6 +3557,7 @@ export class InteractiveMode {
+ 				this.transcriptPresentation.messageEnded(event.message);
+ 				if (event.message.role === "user") break;
+ 				if (this.streamingComponent && event.message.role === "assistant") {
++					this.transcriptPresentation.messagePresented(event.message, this.streamingComponent);
+ 					this.streamingMessage = event.message;
+ 					let errorMessage: string | undefined;
+ 					if (this.streamingMessage.stopReason === "aborted") {
+@@ -3626,6 +3663,10 @@ export class InteractiveMode {
+ 				break;
+ 
+ 			case "agent_settled":
++				// The session flushes deferred bash records before this event.
++				for (const [component, state] of this.pendingBashComponents) {
++					if (state === "deferred") this.pendingBashComponents.set(component, "persisted");
++				}
+ 				await this.checkShutdownRequested();
+ 				break;
+ 
+@@ -3644,6 +3685,7 @@ export class InteractiveMode {
+ 			}
+ 
+ 			case "compaction_end": {
++				const intent = event.reason === "manual" && this.explicitCompactions > 0 ? "explicit" : "background";
+ 				if (this.settingsManager.getShowTerminalProgress()) {
+ 					this.ui.terminal.setProgress(false);
+ 				}
+@@ -3654,7 +3696,7 @@ export class InteractiveMode {
+ 				this.clearStatusIndicator("compaction");
+ 				if (event.aborted) {
+ 					if (event.reason === "manual") {
+-						this.showError("Compaction cancelled");
++						this.showError("Compaction cancelled", intent);
+ 					} else {
+ 						this.showStatus("Auto-compaction cancelled");
+ 					}
+@@ -3673,18 +3715,22 @@ export class InteractiveMode {
+ 							event.result.tokensBefore,
+ 							new Date().toISOString(),
+ 						),
++						{ intent },
+ 					);
+ 					if (event.result.usage) {
+-						this.addCompactionCostNotice({
+-							type: "compaction_cost",
+-							kind: "compaction",
+-							usage: event.result.usage,
+-						});
++						this.addCompactionCostNotice(
++							{
++								type: "compaction_cost",
++								kind: "compaction",
++								usage: event.result.usage,
++							},
++							intent,
++						);
+ 					}
+ 					this.footer.invalidate();
+ 				} else if (event.errorMessage) {
+ 					if (event.reason === "manual") {
+-						this.showError(event.errorMessage);
++						this.showError(event.errorMessage, intent);
+ 					} else {
+ 						this.chatContainer.addChild(new Spacer(1));
+ 						const errorMessage = event.errorMessage;
+@@ -3782,23 +3828,31 @@ export class InteractiveMode {
+ 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
+ 	 * we update the previous status line instead of appending new ones to avoid log spam.
+ 	 */
+-	private showStatus(message: string): void {
++	private showStatus(message: string, intent: TranscriptOutputIntent = "background"): void {
+ 		const children = this.chatContainer.children;
+ 		const last = children.length > 0 ? children[children.length - 1] : undefined;
+ 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
+ 
+-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
+-			this.lastStatusMessage = message;
++		if (
++			last &&
++			secondLast &&
++			last === this.lastStatusText &&
++			secondLast === this.lastStatusSpacer &&
++			intent === this.lastStatusIntent
++		) {
++			this.lastStatusMessage.text = message;
+ 			this.lastStatusText.invalidate();
+ 			this.ui.requestRender();
+ 			return;
+ 		}
+ 
+ 		const spacer = new Spacer(1);
+-		this.lastStatusMessage = message;
+-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
+-		this.chatContainer.addChild(spacer);
+-		this.chatContainer.addChild(text);
++		const status = { text: message };
++		this.lastStatusMessage = status;
++		const text = new ThemedText(() => theme.fg("dim", status.text), 1, 0);
++		this.transcriptPresentation.addOutput(spacer, intent);
++		this.transcriptPresentation.addOutput(text, intent);
++		this.lastStatusIntent = intent;
+ 		this.lastStatusSpacer = spacer;
+ 		this.lastStatusText = text;
+ 		this.ui.requestRender();
+@@ -3826,7 +3880,10 @@ export class InteractiveMode {
+ 		this.chatContainer.addChild(component);
+ 	}
+ 
+-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
++	private addMessageToChat(
++		message: AgentMessage,
++		options?: { populateHistory?: boolean; intent?: TranscriptOutputIntent },
++	): void {
+ 		switch (message.role) {
+ 			case "bashExecution": {
+ 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
+@@ -3839,7 +3896,7 @@ export class InteractiveMode {
+ 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
+ 					message.fullOutputPath,
+ 				);
+-				this.chatContainer.addChild(component);
++				this.transcriptPresentation.addExplicitOutput(component);
+ 				break;
+ 			}
+ 			case "custom": {
+@@ -3857,17 +3914,17 @@ export class InteractiveMode {
+ 				break;
+ 			}
+ 			case "compactionSummary": {
+-				this.chatContainer.addChild(new Spacer(1));
++				this.transcriptPresentation.addOutput(new Spacer(1), options?.intent);
+ 				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+ 				component.setExpanded(this.toolOutputExpanded);
+-				this.chatContainer.addChild(component);
++				this.transcriptPresentation.addOutput(component, options?.intent);
+ 				break;
+ 			}
+ 			case "branchSummary": {
+-				this.chatContainer.addChild(new Spacer(1));
++				this.transcriptPresentation.addOutput(new Spacer(1), options?.intent);
+ 				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+ 				component.setExpanded(this.toolOutputExpanded);
+-				this.chatContainer.addChild(component);
++				this.transcriptPresentation.addOutput(component, options?.intent);
+ 				break;
+ 			}
+ 			case "system":
+@@ -3887,6 +3944,7 @@ export class InteractiveMode {
+ 						);
+ 						component.setExpanded(this.toolOutputExpanded);
+ 						this.chatContainer.addChild(component);
++						this.transcriptPresentation.messagePresented(message, component);
+ 						// Render user message separately if present
+ 						if (skillBlock.userMessage) {
+ 							this.chatContainer.addChild(new Spacer(1));
+@@ -3897,6 +3955,7 @@ export class InteractiveMode {
+ 								this.getMarkdownTransformers(),
+ 							);
+ 							this.chatContainer.addChild(userComponent);
++							this.transcriptPresentation.messagePresented(message, userComponent);
+ 						}
+ 					} else {
+ 						const userComponent = new UserMessageComponent(
+@@ -3906,6 +3965,7 @@ export class InteractiveMode {
+ 							this.getMarkdownTransformers(),
+ 						);
+ 						this.chatContainer.addChild(userComponent);
++						this.transcriptPresentation.messagePresented(message, userComponent);
+ 					}
+ 					if (options?.populateHistory) {
+ 						this.editor.addToHistory?.(textContent);
+@@ -3923,6 +3983,7 @@ export class InteractiveMode {
+ 					this.getMarkdownTransformers(),
+ 				);
+ 				this.chatContainer.addChild(assistantComponent);
++				this.transcriptPresentation.messagePresented(message, assistantComponent);
+ 				break;
+ 			}
+ 			case "toolResult": {
+@@ -3937,7 +3998,7 @@ export class InteractiveMode {
+ 
+ 	private renderSessionItems(
+ 		items: readonly RenderSessionItem[],
+-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
++		options: { updateFooter?: boolean; populateHistory?: boolean; explicitBranchSummary?: AgentMessage } = {},
+ 	): void {
+ 		this.pendingTools.clear();
+ 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
+@@ -3962,7 +4023,7 @@ export class InteractiveMode {
+ 				continue;
+ 			}
+ 			if (isCompactionCostNotice(item)) {
+-				this.addCompactionCostNotice(item);
++				this.addCompactionCostNotice(item, item.intent);
+ 				continue;
+ 			}
+ 
+@@ -4017,8 +4078,11 @@ export class InteractiveMode {
+ 					renderedPendingTools.delete(message.toolCallId);
+ 				}
+ 			} else {
+-				// All other messages use standard rendering
+-				this.addMessageToChat(message, options);
++				// Only the summary returned by the native /tree invocation is an explicit exception.
++				this.addMessageToChat(message, {
++					populateHistory: options.populateHistory,
++					intent: message === options.explicitBranchSummary ? "explicit" : "background",
++				});
+ 			}
+ 		}
+ 
+@@ -4036,19 +4100,37 @@ export class InteractiveMode {
+ 	 */
+ 	private renderSessionEntries(
+ 		entries: SessionEntry[],
+-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
++		options: { updateFooter?: boolean; populateHistory?: boolean; explicitBranchSummaryId?: string } = {},
+ 	): void {
++		// Persisted dock output is represented by authoritative history after a rebuild.
++		// Keep active output and completed results still awaiting the session's flush.
++		for (const [component, state] of this.pendingBashComponents) {
++			if (state !== "persisted") continue;
++			this.pendingMessagesContainer.removeChild(component);
++			this.pendingBashComponents.delete(component);
++		}
++		let explicitBranchSummary: AgentMessage | undefined;
+ 		const items = entries.flatMap((entry): RenderSessionItem[] => {
+ 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
+ 				return [entry];
+ 			}
+ 			const messages = sessionEntryToContextMessages(entry);
++			const isRequestedSummary = entry.type === "branch_summary" && entry.id === options.explicitBranchSummaryId;
++			if (isRequestedSummary) explicitBranchSummary = messages[0];
+ 			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
+-				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
++				return [
++					...messages,
++					{
++						type: "compaction_cost",
++						kind: entry.type,
++						usage: entry.usage,
++						intent: isRequestedSummary ? "explicit" : "background",
++					},
++				];
+ 			}
+ 			return messages;
+ 		});
+-		this.renderSessionItems(items, options);
++		this.renderSessionItems(items, { ...options, explicitBranchSummary });
+ 	}
+ 
+ 	private addCacheWarmingUsage(entry: UsageEntry): void {
+@@ -4062,16 +4144,17 @@ export class InteractiveMode {
+ 	 * Render billing usage for a compaction or branch summary. The notice is derived
+ 	 * from persisted summary usage and is not stored as a separate session entry.
+ 	 */
+-	private addCompactionCostNotice(notice: CompactionCostNotice): void {
++	private addCompactionCostNotice(notice: CompactionCostNotice, intent: TranscriptOutputIntent = "background"): void {
+ 		if (!this.settingsManager.getShowCacheMissNotices()) return;
+ 
+ 		const { usage } = notice;
+ 		const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+ 		const cost = usage.cost.total >= 0.01 ? ` (~$${usage.cost.total.toFixed(2)})` : "";
+ 		const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(
++		this.transcriptPresentation.addOutput(new Spacer(1), intent);
++		this.transcriptPresentation.addOutput(
+ 			new ThemedText(() => theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
++			intent,
+ 		);
+ 	}
+ 
+@@ -4154,12 +4237,13 @@ export class InteractiveMode {
+ 		this.transcriptPresentation.replaceHistory(entries.flatMap(sessionEntryToContextMessages));
+ 	}
+ 
+-	renderInitialMessages(): void {
++	renderInitialMessages(options: { explicitBranchSummaryId?: string } = {}): void {
+ 		const entries = this.sessionManager.buildContextEntries();
+ 		this.reconcilePresentedHistory(entries);
+ 		this.renderSessionEntries(entries, {
+ 			updateFooter: true,
+ 			populateHistory: true,
++			explicitBranchSummaryId: options.explicitBranchSummaryId,
+ 		});
+ 		this.renderProjectTrustWarningIfNeeded();
+ 
+@@ -4208,10 +4292,12 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private rebuildChatFromMessages(): void {
+-		this.chatContainer.clear();
+-		const entries = this.sessionManager.buildContextEntries();
+-		this.reconcilePresentedHistory(entries);
+-		this.renderSessionEntries(entries);
++		this.transcriptPresentation.rebuildPreservingExplicitOutput(this.bashComponent, () => {
++			this.chatContainer.clear();
++			const entries = this.sessionManager.buildContextEntries();
++			this.reconcilePresentedHistory(entries);
++			this.renderSessionEntries(entries);
++		});
+ 	}
+ 
+ 	// =========================================================================
+@@ -4382,7 +4468,7 @@ export class InteractiveMode {
+ 
+ 	private handleCtrlZ(): void {
+ 		if (process.platform === "win32") {
+-			this.showStatus("Suspend to background is not supported on Windows");
++			this.showStatus("Suspend to background is not supported on Windows", "explicit");
+ 			return;
+ 		}
+ 
+@@ -4453,9 +4539,9 @@ export class InteractiveMode {
+ 	private handleDequeue(): void {
+ 		const restored = this.restoreQueuedMessagesToEditor();
+ 		if (restored === 0) {
+-			this.showStatus("No queued messages to restore");
++			this.showStatus("No queued messages to restore", "explicit");
+ 		} else {
+-			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
++			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`, "explicit");
+ 		}
+ 	}
+ 
+@@ -4473,11 +4559,11 @@ export class InteractiveMode {
+ 	private cycleThinkingLevel(): void {
+ 		const newLevel = this.session.cycleThinkingLevel();
+ 		if (newLevel === undefined) {
+-			this.showStatus("Current model does not support thinking");
++			this.showStatus("Current model does not support thinking", "explicit");
+ 		} else {
+ 			this.footer.invalidate();
+ 			this.updateEditorBorderColor();
+-			this.showStatus(`Thinking level: ${newLevel}`);
++			this.showStatus(`Thinking level: ${newLevel}`, "explicit");
+ 		}
+ 	}
+ 
+@@ -4486,17 +4572,17 @@ export class InteractiveMode {
+ 			const result = await this.session.cycleModel(direction);
+ 			if (result === undefined) {
+ 				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
+-				this.showStatus(msg);
++				this.showStatus(msg, "explicit");
+ 			} else {
+ 				this.footer.invalidate();
+ 				this.updateEditorBorderColor();
+ 				const thinkingStr =
+ 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
+-				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
++				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`, "explicit");
+ 				void this.maybeWarnAboutAnthropicSubscriptionAuth(result.model);
+ 			}
+ 		} catch (error) {
+-			this.showError(error instanceof Error ? error.message : String(error));
++			this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 		}
+ 	}
+ 
+@@ -4519,10 +4605,10 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private toggleToolOutputExpansion(): void {
+-		this.setToolsExpanded(!this.toolOutputExpanded);
++		this.setToolsExpanded(!this.toolOutputExpanded, "explicit");
+ 	}
+ 
+-	private setToolsExpanded(expanded: boolean): void {
++	private setToolsExpanded(expanded: boolean, intent: TranscriptOutputIntent = "background"): void {
+ 		if (expanded === this.toolOutputExpanded) return;
+ 
+ 		this.toolOutputExpanded = expanded;
+@@ -4537,7 +4623,7 @@ export class InteractiveMode {
+ 				}
+ 			}
+ 		}
+-		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
++		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`, intent);
+ 	}
+ 
+ 	/** Update rendered assistant messages without rebuilding live tool components. */
+@@ -4554,7 +4640,7 @@ export class InteractiveMode {
+ 		this.hideThinkingBlock = !this.hideThinkingBlock;
+ 		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
+ 		this.updateThinkingBlockVisibility();
+-		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
++		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`, "explicit");
+ 	}
+ 
+ 	private async handleOpenExternalEditor(): Promise<void> {
+@@ -4584,15 +4670,19 @@ export class InteractiveMode {
+ 		this.ui.requestRender();
+ 	}
+ 
+-	showError(errorMessage: string): void {
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
++	showError(errorMessage: string, intent: TranscriptOutputIntent = "background"): void {
++		const spacer = new Spacer(1);
++		const text = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
++		this.transcriptPresentation.addOutput(spacer, intent);
++		this.transcriptPresentation.addOutput(text, intent);
+ 		this.ui.requestRender();
+ 	}
+ 
+-	showWarning(warningMessage: string): void {
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
++	showWarning(warningMessage: string, intent: TranscriptOutputIntent = "background"): void {
++		const spacer = new Spacer(1);
++		const text = new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0);
++		this.transcriptPresentation.addOutput(spacer, intent);
++		this.transcriptPresentation.addOutput(text, intent);
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -4686,6 +4776,7 @@ export class InteractiveMode {
+ 
+ 	private updatePendingMessagesDisplay(): void {
+ 		this.pendingMessagesContainer.clear();
++		for (const component of this.pendingBashComponents.keys()) this.pendingMessagesContainer.addChild(component);
+ 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
+ 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
+ 			this.pendingMessagesContainer.addChild(new Spacer(1));
+@@ -4823,11 +4914,11 @@ export class InteractiveMode {
+ 
+ 	/** Move pending bash components from pending area to chat */
+ 	private flushPendingBashComponents(): void {
+-		for (const component of this.pendingBashComponents) {
++		for (const component of this.pendingBashComponents.keys()) {
+ 			this.pendingMessagesContainer.removeChild(component);
+-			this.chatContainer.addChild(component);
++			this.transcriptPresentation.addExplicitOutput(component);
+ 		}
+-		this.pendingBashComponents = [];
++		this.pendingBashComponents.clear();
+ 	}
+ 
+ 	// =========================================================================
+@@ -4964,11 +5055,11 @@ export class InteractiveMode {
+ 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
+ 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
+ 						configureHttpDispatcher(timeoutMs);
+-						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
++						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`, "explicit");
+ 					},
+ 					onCacheWarmingModeChange: (mode) => {
+ 						this.session.setCacheWarmingMode(mode);
+-						this.showStatus(`Cache warming: ${mode}`);
++						this.showStatus(`Cache warming: ${mode}`, "explicit");
+ 					},
+ 					onModelThinkingLevelChange: (provider, modelId, level) => {
+ 						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
+@@ -5082,12 +5173,12 @@ export class InteractiveMode {
+ 					onTuiModeChange: (mode) => {
+ 						if (!this.switchTuiMode(mode)) {
+ 							selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
+-							this.showStatus("Close active overlays before changing TUI mode");
++							this.showStatus("Close active overlays before changing TUI mode", "explicit");
+ 							return;
+ 						}
+ 						this.settingsManager.setTuiMode(mode);
+ 						if (!this.activeStatusIndicator) this.statusContainer.clear();
+-						this.showStatus(`TUI mode: ${mode}`);
++						this.showStatus(`TUI mode: ${mode}`, "explicit");
+ 					},
+ 					onFullscreenExitOutputChange: (output) => {
+ 						this.settingsManager.setFullscreenExitOutput(output);
+@@ -5127,7 +5218,10 @@ export class InteractiveMode {
+ 		const normalized = searchTerm.trim().toLowerCase();
+ 		const level = availableLevels.find((candidate) => candidate.toLowerCase() === normalized);
+ 		if (!level) {
+-			this.showError(`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`);
++			this.showError(
++				`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`,
++				"explicit",
++			);
+ 			return;
+ 		}
+ 
+@@ -5139,9 +5233,9 @@ export class InteractiveMode {
+ 			this.session.setThinkingLevel(level, { persist });
+ 			this.footer.invalidate();
+ 			this.updateEditorBorderColor();
+-			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
++			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`, "explicit");
+ 		} catch (error) {
+-			this.showError(error instanceof Error ? error.message : String(error));
++			this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 		}
+ 	}
+ 
+@@ -5178,11 +5272,11 @@ export class InteractiveMode {
+ 				await this.session.setModel(model, { persist: false });
+ 				this.footer.invalidate();
+ 				this.updateEditorBorderColor();
+-				this.showStatus(`Model: ${model.id}`);
++				this.showStatus(`Model: ${model.id}`, "explicit");
+ 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+ 				this.checkDaxnutsEasterEgg(model);
+ 			} catch (error) {
+-				this.showError(error instanceof Error ? error.message : String(error));
++				this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 			}
+ 			return;
+ 		}
+@@ -5198,7 +5292,7 @@ export class InteractiveMode {
+ 		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
+ 		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
+ 
+-		this.showStatus("Refreshing model catalogs…");
++		this.showStatus("Refreshing model catalogs…", "explicit");
+ 		const controller = new AbortController();
+ 		let timedOut = false;
+ 		const timeout = setTimeout(() => {
+@@ -5208,15 +5302,19 @@ export class InteractiveMode {
+ 		try {
+ 			const result = await refreshModelCatalogs(this.session.modelRuntime, controller.signal);
+ 			if (result.aborted && timedOut) {
+-				this.showWarning("Model refresh timed out; searching cached models.");
++				this.showWarning("Model refresh timed out; searching cached models.", "explicit");
+ 			} else if (result.errors.size > 0) {
+-				this.showWarning(`Could not refresh ${[...result.errors.keys()].join(", ")}; searching cached models.`);
++				this.showWarning(
++					`Could not refresh ${[...result.errors.keys()].join(", ")}; searching cached models.`,
++					"explicit",
++				);
+ 			}
+ 		} catch (error) {
+ 			this.showWarning(
+ 				timedOut
+ 					? "Model refresh timed out; searching cached models."
+ 					: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
++				"explicit",
+ 			);
+ 		} finally {
+ 			clearTimeout(timeout);
+@@ -5264,7 +5362,7 @@ export class InteractiveMode {
+ 		}
+ 	}
+ 
+-	private maybeSaveImplicitProjectTrustAfterReload(): boolean {
++	private maybeSaveImplicitProjectTrustAfterReload(intent: TranscriptOutputIntent): boolean {
+ 		const cwd = this.sessionManager.getCwd();
+ 		if (this.autoTrustOnReloadCwd !== cwd) {
+ 			return false;
+@@ -5285,6 +5383,7 @@ export class InteractiveMode {
+ 		} catch (error) {
+ 			this.showWarning(
+ 				`Could not save project trust after reload: ${error instanceof Error ? error.message : String(error)}`,
++				intent,
+ 			);
+ 			return false;
+ 		}
+@@ -5304,6 +5403,7 @@ export class InteractiveMode {
+ 					done();
+ 					this.showStatus(
+ 						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart ${APP_NAME} for this to take effect.`,
++						"explicit",
+ 					);
+ 				},
+ 				onCancel: () => {
+@@ -5324,12 +5424,15 @@ export class InteractiveMode {
+ 					this.footer.invalidate();
+ 					this.updateEditorBorderColor();
+ 					done();
+-					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
++					this.showStatus(
++						persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`,
++						"explicit",
++					);
+ 					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+ 					this.checkDaxnutsEasterEgg(model);
+ 				} catch (error) {
+ 					done();
+-					this.showError(error instanceof Error ? error.message : String(error));
++					this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 				}
+ 			};
+ 			const defaultProvider = this.settingsManager.getDefaultProvider();
+@@ -5419,7 +5522,7 @@ export class InteractiveMode {
+ 							enabledIds.every((id) => availableModelIds.has(id));
+ 						const newPatterns = enabledIds === null || allEnabled ? undefined : enabledIds;
+ 						this.settingsManager.setEnabledModels(newPatterns ? [...newPatterns] : undefined);
+-						this.showStatus("Model selection saved to settings");
++						this.showStatus("Model selection saved to settings", "explicit");
+ 					},
+ 					onCancel: () => {
+ 						done();
+@@ -5478,7 +5581,7 @@ export class InteractiveMode {
+ 		const userMessages = this.session.getUserMessagesForForking();
+ 
+ 		if (userMessages.length === 0) {
+-			this.showStatus("No messages to fork from");
++			this.showStatus("No messages to fork from", "explicit");
+ 			return;
+ 		}
+ 
+@@ -5497,9 +5600,9 @@ export class InteractiveMode {
+ 						}
+ 
+ 						this.editor.setText(result.selectedText ?? "");
+-						this.showStatus("Forked to new session");
++						this.showStatus("Forked to new session", "explicit");
+ 					} catch (error: unknown) {
+-						this.showError(error instanceof Error ? error.message : String(error));
++						this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 					}
+ 				},
+ 				() => {
+@@ -5515,7 +5618,7 @@ export class InteractiveMode {
+ 	private async handleCloneCommand(): Promise<void> {
+ 		const leafId = this.sessionManager.getLeafId();
+ 		if (!leafId) {
+-			this.showStatus("Nothing to clone yet");
++			this.showStatus("Nothing to clone yet", "explicit");
+ 			return;
+ 		}
+ 
+@@ -5527,9 +5630,9 @@ export class InteractiveMode {
+ 			}
+ 
+ 			this.editor.setText("");
+-			this.showStatus("Cloned to new session");
++			this.showStatus("Cloned to new session", "explicit");
+ 		} catch (error: unknown) {
+-			this.showError(error instanceof Error ? error.message : String(error));
++			this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 		}
+ 	}
+ 
+@@ -5539,7 +5642,7 @@ export class InteractiveMode {
+ 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
+ 
+ 		if (tree.length === 0) {
+-			this.showStatus("No entries in session");
++			this.showStatus("No entries in session", "explicit");
+ 			return;
+ 		}
+ 
+@@ -5552,7 +5655,7 @@ export class InteractiveMode {
+ 					// Selecting the current leaf is a no-op (already there)
+ 					if (entryId === this.sessionManager.getLeafId()) {
+ 						done();
+-						this.showStatus("Already at this point");
++						this.showStatus("Already at this point", "explicit");
+ 						return;
+ 					}
+ 
+@@ -5603,6 +5706,7 @@ export class InteractiveMode {
+ 					if (this.session.isCompacting) {
+ 						this.showError(
+ 							"Wait for the current compaction or tree navigation to finish before navigating the session tree.",
++							"explicit",
+ 						);
+ 						return;
+ 					}
+@@ -5629,25 +5733,25 @@ export class InteractiveMode {
+ 
+ 						if (result.aborted) {
+ 							// Summarization aborted - re-show tree selector with same selection
+-							this.showStatus("Branch summarization cancelled");
++							this.showStatus("Branch summarization cancelled", "explicit");
+ 							this.showTreeSelector(entryId);
+ 							return;
+ 						}
+ 						if (result.cancelled) {
+-							this.showStatus("Navigation cancelled");
++							this.showStatus("Navigation cancelled", "explicit");
+ 							return;
+ 						}
+ 
+-						// Update UI
++						// Update UI with the exact newly requested summary, never historical summaries.
+ 						this.chatContainer.clear();
+-						this.renderInitialMessages();
++						this.renderInitialMessages({ explicitBranchSummaryId: result.summaryEntry?.id });
+ 						if (result.editorText && !this.editor.getText().trim()) {
+ 							this.editor.setText(result.editorText);
+ 						}
+-						this.showStatus("Navigated to selected point");
++						this.showStatus("Navigated to selected point", "explicit");
+ 						void this.flushCompactionQueue({ willRetry: false });
+ 					} catch (error) {
+-						this.showError(error instanceof Error ? error.message : String(error));
++						this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 					} finally {
+ 						if (showingSummaryIndicator) {
+ 							this.clearStatusIndicator("branchSummary");
+@@ -5668,14 +5772,14 @@ export class InteractiveMode {
+ 			);
+ 			selector.onCopy = async (text) => {
+ 				if (!text) {
+-					this.showError("Selected entry has no text to copy");
++					this.showError("Selected entry has no text to copy", "explicit");
+ 					return;
+ 				}
+ 				try {
+ 					await copyToClipboard(text);
+-					this.showStatus("Copied selected message to clipboard");
++					this.showStatus("Copied selected message to clipboard", "explicit");
+ 				} catch (error) {
+-					this.showError(error instanceof Error ? error.message : String(error));
++					this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 				}
+ 			};
+ 			return { component: selector, focus: selector };
+@@ -5698,7 +5802,7 @@ export class InteractiveMode {
+ 						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, signal),
+ 				async (sessionPath) => {
+ 					done();
+-					await this.handleResumeSession(sessionPath);
++					await this.handleResumeSession(sessionPath, undefined, "explicit");
+ 				},
+ 				() => {
+ 					done();
+@@ -5728,6 +5832,7 @@ export class InteractiveMode {
+ 	private async handleResumeSession(
+ 		sessionPath: string,
+ 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
++		intent: TranscriptOutputIntent = "background",
+ 	): Promise<{ cancelled: boolean }> {
+ 		this.clearStatusIndicator();
+ 		try {
+@@ -5738,13 +5843,13 @@ export class InteractiveMode {
+ 			if (result.cancelled) {
+ 				return result;
+ 			}
+-			this.showStatus("Resumed session");
++			this.showStatus("Resumed session", intent);
+ 			return result;
+ 		} catch (error: unknown) {
+ 			if (error instanceof MissingSessionCwdError) {
+ 				const selectedCwd = await this.promptForMissingSessionCwd(error);
+ 				if (!selectedCwd) {
+-					this.showStatus("Resume cancelled");
++					this.showStatus("Resume cancelled", intent);
+ 					return { cancelled: true };
+ 				}
+ 				const result = await this.runtimeHost.switchSession(sessionPath, {
+@@ -5755,7 +5860,7 @@ export class InteractiveMode {
+ 				if (result.cancelled) {
+ 					return result;
+ 				}
+-				this.showStatus("Resumed session in current cwd");
++				this.showStatus("Resumed session in current cwd", intent);
+ 				return result;
+ 			}
+ 			return this.handleFatalRuntimeError("Failed to resume session", error);
+@@ -5884,7 +5989,7 @@ export class InteractiveMode {
+ 		if (radiusLabel) options.push(radiusLabel);
+ 
+ 		if (options.length === 0) {
+-			this.showStatus("No login methods available.");
++			this.showStatus("No login methods available.", "explicit");
+ 			return;
+ 		}
+ 
+@@ -5944,7 +6049,7 @@ export class InteractiveMode {
+ 					: authType === "api_key"
+ 						? "No API key providers available."
+ 						: "No login providers available.";
+-			this.showStatus(message);
++			this.showStatus(message, "explicit");
+ 			return;
+ 		}
+ 
+@@ -5990,12 +6095,16 @@ export class InteractiveMode {
+ 		try {
+ 			providerOptions = await this.getLogoutProviderOptions();
+ 		} catch (error) {
+-			this.showError(`Could not read stored credentials: ${error instanceof Error ? error.message : String(error)}`);
++			this.showError(
++				`Could not read stored credentials: ${error instanceof Error ? error.message : String(error)}`,
++				"explicit",
++			);
+ 			return;
+ 		}
+ 		if (providerOptions.length === 0) {
+ 			this.showStatus(
+ 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
++				"explicit",
+ 			);
+ 			return;
+ 		}
+@@ -6021,13 +6130,14 @@ export class InteractiveMode {
+ 							providerOption.authType === "oauth"
+ 								? `Logged out of ${providerOption.name}`
+ 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
+-						this.showStatus(message);
++						this.showStatus(message, "explicit");
+ 					} catch (error: unknown) {
+ 						const message = error instanceof Error ? error.message : String(error);
+ 						this.showError(
+ 							error instanceof CredentialSynchronizationError
+ 								? `Credentials removed for ${providerOption.name}, but local model state could not be synchronized: ${message}`
+ 								: `Logout failed: ${message}`,
++							"explicit",
+ 						);
+ 					}
+ 				},
+@@ -6093,20 +6203,26 @@ export class InteractiveMode {
+ 			this.footer.invalidate();
+ 			this.updateEditorBorderColor();
+ 			if (selectedModel) {
+-				this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
++				this.showStatus(
++					`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`,
++					"explicit",
++				);
+ 				void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
+ 				this.checkDaxnutsEasterEgg(selectedModel);
+ 			} else {
+-				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
++				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`, "explicit");
+ 				if (selectionError) {
+-					this.showError(selectionError);
++					this.showError(selectionError, "explicit");
+ 				} else {
+ 					void this.maybeWarnAboutAnthropicSubscriptionAuth();
+ 				}
+ 			}
+ 		};
+ 		if (deferSelection) {
+-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`);
++			this.showStatus(
++				`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`,
++				"explicit",
++			);
+ 		} else {
+ 			await finishAuthentication();
+ 		}
+@@ -6117,9 +6233,15 @@ export class InteractiveMode {
+ 			.refresh({ providers: [providerId], signal: controller.signal })
+ 			.then(async (result) => {
+ 				if (result.aborted) {
+-					this.showWarning(`${actionLabel}, but its model catalog refresh timed out; using cached models.`);
++					this.showWarning(
++						`${actionLabel}, but its model catalog refresh timed out; using cached models.`,
++						"explicit",
++					);
+ 				} else if (result.errors.size > 0) {
+-					this.showWarning(`${actionLabel}, but its model catalog could not be refreshed; using cached models.`);
++					this.showWarning(
++						`${actionLabel}, but its model catalog could not be refreshed; using cached models.`,
++						"explicit",
++					);
+ 				}
+ 				// Do not replace a model or session selected while the refresh was running.
+ 				if (deferSelection && this.session === session && session.model === previousModel) {
+@@ -6132,6 +6254,7 @@ export class InteractiveMode {
+ 			.catch((error: unknown) => {
+ 				this.showWarning(
+ 					`${actionLabel}, but its model catalog could not be refreshed: ${error instanceof Error ? error.message : String(error)}`,
++					"explicit",
+ 				);
+ 			})
+ 			.finally(() => clearTimeout(timeout));
+@@ -6209,11 +6332,12 @@ export class InteractiveMode {
+ 			if (error instanceof CredentialSynchronizationError) {
+ 				this.showError(
+ 					`Saved API key for ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
++					"explicit",
+ 				);
+ 			} else if (errorMsg === "Login cancelled") {
+ 				onBack?.();
+ 			} else {
+-				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
++				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`, "explicit");
+ 			}
+ 		}
+ 	}
+@@ -6333,11 +6457,12 @@ export class InteractiveMode {
+ 			if (error instanceof CredentialSynchronizationError) {
+ 				this.showError(
+ 					`Logged in to ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
++					"explicit",
+ 				);
+ 			} else if (errorMsg === "Login cancelled") {
+ 				onBack?.();
+ 			} else {
+-				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
++				this.showError(`Failed to login to ${providerName}: ${errorMsg}`, "explicit");
+ 			}
+ 		}
+ 	}
+@@ -6380,11 +6505,12 @@ export class InteractiveMode {
+ 					} catch (error: unknown) {
+ 						this.showError(
+ 							`Could not update ${mcpPath}: ${error instanceof Error ? error.message : String(error)}`,
++							"explicit",
+ 						);
+ 						return;
+ 					}
+ 					// The MCP extension reads mcp.json when the session starts.
+-					void this.handleReloadCommand();
++					void this.handleReloadCommand("explicit");
+ 				},
+ 				() => {
+ 					done();
+@@ -6399,13 +6525,13 @@ export class InteractiveMode {
+ 	// Command handlers
+ 	// =========================================================================
+ 
+-	private async handleReloadCommand(): Promise<void> {
++	private async handleReloadCommand(intent: TranscriptOutputIntent = "background"): Promise<void> {
+ 		if (this.session.isStreaming) {
+-			this.showWarning("Wait for the current response to finish before reloading.");
++			this.showWarning("Wait for the current response to finish before reloading.", intent);
+ 			return;
+ 		}
+ 		if (this.session.isCompacting) {
+-			this.showWarning("Wait for compaction to finish before reloading.");
++			this.showWarning("Wait for compaction to finish before reloading.", intent);
+ 			return;
+ 		}
+ 
+@@ -6470,15 +6596,16 @@ export class InteractiveMode {
+ 				force: false,
+ 				showDiagnosticsWhenQuiet: true,
+ 			});
+-			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload();
++			const savedImplicitProjectTrust = this.maybeSaveImplicitProjectTrustAfterReload(intent);
+ 			const modelsJsonError = this.session.modelRuntime.getError();
+ 			if (modelsJsonError) {
+-				this.showError(`models.json error: ${modelsJsonError}`);
++				this.showError(`models.json error: ${modelsJsonError}`, intent);
+ 			}
+ 			this.showStatus(
+ 				savedImplicitProjectTrust
+ 					? "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
+ 					: "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
++				intent,
+ 			);
+ 			dismissReloadBox(this.editor as Component);
+ 			reloadBoxDismissed = true;
+@@ -6486,7 +6613,7 @@ export class InteractiveMode {
+ 			if (!reloadBoxDismissed) {
+ 				dismissReloadBox(previousEditor as Component);
+ 			}
+-			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
++			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`, intent);
+ 		}
+ 	}
+ 
+@@ -6496,15 +6623,18 @@ export class InteractiveMode {
+ 		try {
+ 			if (outputPath?.endsWith(".jsonl")) {
+ 				const filePath = this.session.exportToJsonl(outputPath);
+-				this.showStatus(`Session exported to: ${filePath}`);
++				this.showStatus(`Session exported to: ${filePath}`, "explicit");
+ 			} else {
+ 				const filePath = await this.session.exportToHtml(outputPath, {
+ 					themeName: theme.name,
+ 				});
+-				this.showStatus(`Session exported to: ${filePath}`);
++				this.showStatus(`Session exported to: ${filePath}`, "explicit");
+ 			}
+ 		} catch (error: unknown) {
+-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
++			this.showError(
++				`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`,
++				"explicit",
++			);
+ 		}
+ 	}
+ 
+@@ -6540,13 +6670,13 @@ export class InteractiveMode {
+ 	private async handleImportCommand(text: string): Promise<void> {
+ 		const inputPath = this.getPathCommandArgument(text, "/import");
+ 		if (!inputPath) {
+-			this.showError("Usage: /import <path.jsonl>");
++			this.showError("Usage: /import <path.jsonl>", "explicit");
+ 			return;
+ 		}
+ 
+ 		const confirmed = await this.showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`);
+ 		if (!confirmed) {
+-			this.showStatus("Import cancelled");
++			this.showStatus("Import cancelled", "explicit");
+ 			return;
+ 		}
+ 
+@@ -6554,27 +6684,27 @@ export class InteractiveMode {
+ 			this.clearStatusIndicator();
+ 			const result = await this.runtimeHost.importFromJsonl(inputPath);
+ 			if (result.cancelled) {
+-				this.showStatus("Import cancelled");
++				this.showStatus("Import cancelled", "explicit");
+ 				return;
+ 			}
+-			this.showStatus(`Session imported from: ${inputPath}`);
++			this.showStatus(`Session imported from: ${inputPath}`, "explicit");
+ 		} catch (error: unknown) {
+ 			if (error instanceof MissingSessionCwdError) {
+ 				const selectedCwd = await this.promptForMissingSessionCwd(error);
+ 				if (!selectedCwd) {
+-					this.showStatus("Import cancelled");
++					this.showStatus("Import cancelled", "explicit");
+ 					return;
+ 				}
+ 				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
+ 				if (result.cancelled) {
+-					this.showStatus("Import cancelled");
++					this.showStatus("Import cancelled", "explicit");
+ 					return;
+ 				}
+-				this.showStatus(`Session imported from: ${inputPath}`);
++				this.showStatus(`Session imported from: ${inputPath}`, "explicit");
+ 				return;
+ 			}
+ 			if (error instanceof SessionImportFileNotFoundError) {
+-				this.showError(`Failed to import session: ${error.message}`);
++				this.showError(`Failed to import session: ${error.message}`, "explicit");
+ 				return;
+ 			}
+ 			await this.handleFatalRuntimeError("Failed to import session", error);
+@@ -6587,8 +6717,8 @@ export class InteractiveMode {
+ 			ui: this.ui,
+ 			editorContainer: this.editorContainer,
+ 			editor: this.editor,
+-			showStatus: (message) => this.showStatus(message),
+-			showError: (message) => this.showError(message),
++			showStatus: (message) => this.showStatus(message, "explicit"),
++			showError: (message) => this.showError(message, "explicit"),
+ 		});
+ 	}
+ 
+@@ -6600,8 +6730,8 @@ export class InteractiveMode {
+ 				editorContainer: this.editorContainer,
+ 				editor: this.editor,
+ 				keybindings: this.keybindings,
+-				showStatus: (message) => this.showStatus(message),
+-				showError: (message) => this.showError(message),
++				showStatus: (message) => this.showStatus(message, "explicit"),
++				showError: (message) => this.showError(message, "explicit"),
+ 			},
+ 			hint,
+ 		);
+@@ -6622,7 +6752,7 @@ export class InteractiveMode {
+ 
+ 		const text = this.session.getLastAssistantText();
+ 		if (!text) {
+-			this.showError("No agent messages to copy yet.");
++			this.showError("No agent messages to copy yet.", "explicit");
+ 			return;
+ 		}
+ 
+@@ -6631,10 +6761,10 @@ export class InteractiveMode {
+ 			if (options.flashConfirmation && this.ui instanceof TuiAltScreen) {
+ 				this.ui.flash("Copied!");
+ 			} else {
+-				this.showStatus("Copied last agent message to clipboard");
++				this.showStatus("Copied last agent message to clipboard", "explicit");
+ 			}
+ 		} catch (error) {
+-			this.showError(error instanceof Error ? error.message : String(error));
++			this.showError(error instanceof Error ? error.message : String(error), "explicit");
+ 		}
+ 	}
+ 
+@@ -6643,10 +6773,12 @@ export class InteractiveMode {
+ 		if (!name) {
+ 			const currentName = this.sessionManager.getSessionName();
+ 			if (currentName) {
+-				this.chatContainer.addChild(new Spacer(1));
+-				this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", `Session name: ${currentName}`), 1, 0));
++				this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++				this.transcriptPresentation.addExplicitOutput(
++					new ThemedText(() => theme.fg("dim", `Session name: ${currentName}`), 1, 0),
++				);
+ 			} else {
+-				this.showWarning("Usage: /name <name>");
++				this.showWarning("Usage: /name <name>", "explicit");
+ 			}
+ 			this.ui.requestRender();
+ 			return;
+@@ -6655,11 +6787,16 @@ export class InteractiveMode {
+ 		this.session.setSessionName(name);
+ 		const sessionName = this.sessionManager.getSessionName();
+ 		if (sessionName !== name) {
+-			this.showWarning(`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`);
++			this.showWarning(
++				`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`,
++				"explicit",
++			);
+ 		}
+-		this.chatContainer.addChild(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
+ 		const displayName = sessionName ?? name;
+-		this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", `Session name set: ${displayName}`), 1, 0));
++		this.transcriptPresentation.addExplicitOutput(
++			new ThemedText(() => theme.fg("dim", `Session name set: ${displayName}`), 1, 0),
++		);
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6739,8 +6876,8 @@ export class InteractiveMode {
+ 			return info;
+ 		};
+ 
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ThemedText(renderInfo, 1, 0));
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(new ThemedText(renderInfo, 1, 0));
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6756,12 +6893,14 @@ export class InteractiveMode {
+ 						.join("\n\n")
+ 				: "No changelog entries found.";
+ 
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new DynamicBorder());
+-		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
+-		this.chatContainer.addChild(new DynamicBorder());
++		const output = new Container();
++		output.addChild(new Spacer(1));
++		output.addChild(new DynamicBorder());
++		output.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), 1, 0));
++		output.addChild(new Spacer(1));
++		output.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
++		output.addChild(new DynamicBorder());
++		this.transcriptPresentation.addExplicitOutput(output);
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6889,12 +7028,14 @@ export class InteractiveMode {
+ 			}
+ 		}
+ 
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new DynamicBorder());
+-		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
+-		this.chatContainer.addChild(new DynamicBorder());
++		const output = new Container();
++		output.addChild(new Spacer(1));
++		output.addChild(new DynamicBorder());
++		output.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
++		output.addChild(new Spacer(1));
++		output.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
++		output.addChild(new DynamicBorder());
++		this.transcriptPresentation.addExplicitOutput(output);
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6905,8 +7046,10 @@ export class InteractiveMode {
+ 			if (result.cancelled) {
+ 				return;
+ 			}
+-			this.chatContainer.addChild(new Spacer(1));
+-			this.chatContainer.addChild(new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1));
++			this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++			this.transcriptPresentation.addExplicitOutput(
++				new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1),
++			);
+ 			this.ui.requestRender();
+ 		} catch (error: unknown) {
+ 			await this.handleFatalRuntimeError("Failed to create session", error);
+@@ -6939,28 +7082,28 @@ export class InteractiveMode {
+ 		fs.mkdirSync(path.dirname(debugLogPath), { recursive: true });
+ 		fs.writeFileSync(debugLogPath, debugData);
+ 
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(
+ 			new ThemedText(() => `${theme.fg("accent", "✓ Debug log written")}\n${theme.fg("muted", debugLogPath)}`, 1, 1),
+ 		);
+ 		this.ui.requestRender();
+ 	}
+ 
+ 	private handleArminSaysHi(): void {
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ArminComponent(this.ui));
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(new ArminComponent(this.ui));
+ 		this.ui.requestRender();
+ 	}
+ 
+ 	private handleDementedDelves(): void {
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new EarendilAnnouncementComponent());
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(new EarendilAnnouncementComponent());
+ 		this.ui.requestRender();
+ 	}
+ 
+ 	private handleDaxnuts(): void {
+-		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new DaxnutsComponent(this.ui));
++		this.transcriptPresentation.addExplicitOutput(new Spacer(1));
++		this.transcriptPresentation.addExplicitOutput(new DaxnutsComponent(this.ui));
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6970,8 +7113,10 @@ export class InteractiveMode {
+ 		}
+ 	}
+ 
+-	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+-		const extensionRunner = this.session.extensionRunner;
++	private async handleBashCommand(command: string, excludeFromContext: boolean, reservation: symbol): Promise<void> {
++		const session = this.session;
++		const extensionRunner = session.extensionRunner;
++		const isCurrent = () => this.session === session && this.bashCommandPending === reservation;
+ 
+ 		// Emit user_bash event to let extensions intercept
+ 		let eventResult: UserBashEventResult | undefined;
+@@ -6982,11 +7127,16 @@ export class InteractiveMode {
+ 				excludeFromContext,
+ 				cwd: this.sessionManager.getCwd(),
+ 			});
+-		} catch {
+-			// The extension runner already reported the error. Do not fall back to local execution.
++		} catch (error) {
++			if (!isCurrent()) return;
++			// Keep the extension diagnostic in ordinary output and expose the manual command's failure.
++			// Never fall back to local execution when interception fails.
++			this.showError(`Bash command failed: ${error instanceof Error ? error.message : String(error)}`, "explicit");
+ 			return;
+ 		}
+ 
++		if (!isCurrent()) return;
++
+ 		// If extension returned a full result, use it directly
+ 		if (eventResult?.result) {
+ 			const result = eventResult.result;
+@@ -6995,9 +7145,9 @@ export class InteractiveMode {
+ 			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+ 			if (this.session.isStreaming) {
+ 				this.pendingMessagesContainer.addChild(this.bashComponent);
+-				this.pendingBashComponents.push(this.bashComponent);
++				this.pendingBashComponents.set(this.bashComponent, "unrecorded");
+ 			} else {
+-				this.chatContainer.addChild(this.bashComponent);
++				this.transcriptPresentation.addExplicitOutput(this.bashComponent);
+ 			}
+ 
+ 			// Show output and complete
+@@ -7012,51 +7162,59 @@ export class InteractiveMode {
+ 			);
+ 
+ 			// Record the result in session
+-			this.session.recordBashResult(command, result, { excludeFromContext });
++			session.recordBashResult(command, result, { excludeFromContext });
++			if (this.pendingBashComponents.has(this.bashComponent)) {
++				this.pendingBashComponents.set(
++					this.bashComponent,
++					session.hasPendingBashMessages ? "deferred" : "persisted",
++				);
++			}
+ 			this.bashComponent = undefined;
+ 			this.ui.requestRender();
+ 			return;
+ 		}
+ 
+ 		// Normal execution path (possibly with custom operations)
+-		const isDeferred = this.session.isStreaming;
+-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
++		const isDeferred = session.isStreaming;
++		const component = new BashExecutionComponent(command, this.ui, excludeFromContext);
++		this.bashComponent = component;
+ 
+ 		if (isDeferred) {
+ 			// Show in pending area when agent is streaming
+ 			this.pendingMessagesContainer.addChild(this.bashComponent);
+-			this.pendingBashComponents.push(this.bashComponent);
++			this.pendingBashComponents.set(this.bashComponent, "unrecorded");
+ 		} else {
+ 			// Show in chat immediately when agent is idle
+-			this.chatContainer.addChild(this.bashComponent);
++			this.transcriptPresentation.addExplicitOutput(this.bashComponent);
+ 		}
+ 		this.ui.requestRender();
+ 
+ 		try {
+-			const result = await this.session.executeBash(
++			const result = await session.executeBash(
+ 				command,
+ 				(chunk) => {
+-					if (this.bashComponent) {
+-						this.bashComponent.appendOutput(chunk);
++					if (isCurrent()) {
++						component.appendOutput(chunk);
+ 						this.ui.requestRender();
+ 					}
+ 				},
+ 				{ excludeFromContext, operations: eventResult?.operations },
+ 			);
+ 
+-			if (this.bashComponent) {
+-				this.bashComponent.setComplete(
+-					result.exitCode,
+-					result.cancelled,
+-					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+-					result.fullOutputPath,
+-				);
++			if (!isCurrent()) return;
++			if (this.pendingBashComponents.has(component)) {
++				this.pendingBashComponents.set(component, session.hasPendingBashMessages ? "deferred" : "persisted");
+ 			}
++			component.setComplete(
++				result.exitCode,
++				result.cancelled,
++				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
++				result.fullOutputPath,
++			);
+ 		} catch (error) {
+-			if (this.bashComponent) {
+-				this.bashComponent.setComplete(undefined, false);
+-			}
+-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
++			if (!isCurrent()) return;
++			component.setComplete(undefined, false);
++			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`, "explicit");
+ 		}
+ 
+ 		this.bashComponent = undefined;
+@@ -7066,10 +7224,13 @@ export class InteractiveMode {
+ 	private async handleCompactCommand(customInstructions?: string): Promise<void> {
+ 		this.clearStatusIndicator();
+ 
++		this.explicitCompactions++;
+ 		try {
+ 			await this.session.compact(customInstructions);
+ 		} catch {
+ 			// Ignore, will be emitted as an event
++		} finally {
++			this.explicitCompactions--;
+ 		}
+ 	}
+ 
+diff --git a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+index a58f224e1..d5ba6f781 100644
+--- a/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
++++ b/packages/coding-agent/src/modes/interactive/transcript-presentation.ts
+@@ -6,10 +6,12 @@ import type { MarkdownTransformer } from "../../core/extensions/types.ts";
+ import { AssistantMessageComponent } from "./components/assistant-message.ts";
+ import { UserMessageComponent } from "./components/user-message.ts";
+ 
++export type TranscriptOutputIntent = "explicit" | "background";
++
+ export interface TranscriptPresentationOptions {
+ 	readonly header: Component;
+ 	readonly resources: Component;
+-	readonly transcript: Component;
++	readonly transcript: Container;
+ 	readonly pendingOutput: Container;
+ 	readonly getMarkdownTheme: () => MarkdownTheme;
+ 	readonly getOutputPad: () => number;
+@@ -32,6 +34,8 @@ export class TranscriptPresentation {
+ 	private readonly conversation = new Container();
+ 	private readonly options: TranscriptPresentationOptions;
+ 	private messages: AgentMessage[] = [];
++	private readonly messageComponents = new Map<Component, AgentMessage>();
++	private readonly explicitOutput = new Set<Component>();
+ 	private focusEnabled = false;
+ 
+ 	constructor(options: TranscriptPresentationOptions) {
+@@ -58,16 +62,63 @@ export class TranscriptPresentation {
+ 		this.refreshConversation();
+ 	}
+ 
++	/** Bind conversation projections to native components so explicit output keeps native ordering. */
++	messagePresented(message: AgentMessage, component: Component): void {
++		this.messageComponents.set(component, message);
++		this.refreshConversation();
++	}
++
++	/** Share the native component, including its live updates; never reconstruct command output. */
++	addExplicitOutput(component: Component): void {
++		this.addOutput(component, "explicit");
++	}
++
++	addOutput(component: Component, intent: TranscriptOutputIntent = "background"): void {
++		this.options.transcript.addChild(component);
++		if (intent === "explicit") {
++			this.explicitOutput.add(component);
++			this.refreshConversation();
++		}
++	}
++
++	/** Retain a mounted live exception at its native position while the host refreshes history. */
++	rebuildPreservingExplicitOutput(component: Component | undefined, rebuild: () => void): void {
++		const children = this.options.transcript.children;
++		const index = component ? children.indexOf(component) : -1;
++		const followingMessages =
++			index < 0
++				? undefined
++				: new Set(
++						children.slice(index + 1).flatMap((child) => {
++							const message = this.messageComponents.get(child);
++							return message ? [message] : [];
++						}),
++					);
++		rebuild();
++		// Pending dock components are not mounted in the transcript and stay in their native surface.
++		if (!component || !followingMessages) return;
++		const restoredChildren = this.options.transcript.children;
++		const before = restoredChildren.findIndex((child) => {
++			const message = this.messageComponents.get(child);
++			return message !== undefined && followingMessages.has(message);
++		});
++		restoredChildren.splice(before < 0 ? restoredChildren.length : before, 0, component);
++		this.explicitOutput.add(component);
++		this.refreshConversation();
++	}
++
+ 	/** Session-local presentation state is discarded, but the process-local viewing preference survives. */
+ 	resetSession(): void {
+ 		this.options.pendingOutput.clear();
++		this.messageComponents.clear();
++		this.explicitOutput.clear();
+ 		this.replaceHistory([]);
+ 	}
+ 
+ 	messageStarted(message: AgentMessage): void {
+ 		if (message.role !== "user") return;
+ 		this.messages.push(message);
+-		this.renderConversationMessage(message);
++		this.refreshConversation();
+ 	}
+ 
+ 	/** Consume the completed event directly: listeners run before session persistence. */
+@@ -113,7 +164,26 @@ export class TranscriptPresentation {
+ 	/** Refresh rendering inputs without rebuilding the ordinary live component graph. */
+ 	refreshConversation(): void {
+ 		this.conversation.clear();
+-		for (const message of this.messages) this.renderConversationMessage(message);
++		const nativeChildren = new Set(this.options.transcript.children);
++		for (const component of this.messageComponents.keys()) {
++			if (!nativeChildren.has(component)) this.messageComponents.delete(component);
++		}
++		for (const component of this.explicitOutput) {
++			if (!nativeChildren.has(component)) this.explicitOutput.delete(component);
++		}
++		const presented = new Set<AgentMessage>();
++		for (const component of this.options.transcript.children) {
++			if (this.explicitOutput.has(component)) this.conversation.addChild(component);
++			const message = this.messageComponents.get(component);
++			if (message && this.messages.includes(message) && !presented.has(message)) {
++				this.renderConversationMessage(message);
++				presented.add(message);
++			}
++		}
++		// History and live boundaries can arrive before the host mounts their native components.
++		for (const message of this.messages) {
++			if (!presented.has(message)) this.renderConversationMessage(message);
++		}
+ 	}
+ 
+ 	private renderMessage(message: ConversationMessage): void {
+diff --git a/packages/coding-agent/test/interactive-mode-clone-command.test.ts b/packages/coding-agent/test/interactive-mode-clone-command.test.ts
+index 69864146a..4f85c9624 100644
+--- a/packages/coding-agent/test/interactive-mode-clone-command.test.ts
++++ b/packages/coding-agent/test/interactive-mode-clone-command.test.ts
+@@ -43,7 +43,7 @@ describe("InteractiveMode /clone", () => {
+ 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
+ 		expect(renderCurrentSessionState).not.toHaveBeenCalled();
+ 		expect(setText).toHaveBeenCalledWith("");
+-		expect(showStatus).toHaveBeenCalledWith("Cloned to new session");
++		expect(showStatus).toHaveBeenCalledWith("Cloned to new session", "explicit");
+ 		expect(showError).not.toHaveBeenCalled();
+ 		expect(requestRender).not.toHaveBeenCalled();
+ 	});
+@@ -66,7 +66,7 @@ describe("InteractiveMode /clone", () => {
+ 		await interactiveModePrototype.handleCloneCommand.call(context);
+ 
+ 		expect(fork).not.toHaveBeenCalled();
+-		expect(showStatus).toHaveBeenCalledWith("Nothing to clone yet");
++		expect(showStatus).toHaveBeenCalledWith("Nothing to clone yet", "explicit");
+ 		expect(showError).not.toHaveBeenCalled();
+ 	});
+ });
+diff --git a/packages/coding-agent/test/interactive-mode-compaction.test.ts b/packages/coding-agent/test/interactive-mode-compaction.test.ts
+index d0e033323..5faa42d3c 100644
+--- a/packages/coding-agent/test/interactive-mode-compaction.test.ts
++++ b/packages/coding-agent/test/interactive-mode-compaction.test.ts
+@@ -2,8 +2,10 @@ import type { Usage } from "@earendil-works/pi-ai";
+ import { Container } from "@earendil-works/pi-tui";
+ import { describe, expect, test, vi } from "vitest";
+ import type { SessionEntry } from "../src/core/session-manager.ts";
++import type { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.ts";
+ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
+ import { stripAnsi } from "../src/utils/ansi.ts";
+ 
+ describe("InteractiveMode compaction events", () => {
+@@ -17,7 +19,11 @@ describe("InteractiveMode compaction events", () => {
+ 			cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.065, total: 0.125 },
+ 		};
+ 		const addCompactionCostNotice = Reflect.get(InteractiveMode.prototype, "addCompactionCostNotice") as (
+-			this: { chatContainer: Container; settingsManager: { getShowCacheMissNotices(): boolean } },
++			this: {
++				chatContainer: Container;
++				transcriptPresentation: TranscriptPresentation;
++				settingsManager: { getShowCacheMissNotices(): boolean };
++			},
+ 			notice: {
+ 				type: "compaction_cost";
+ 				kind: "compaction" | "branch_summary";
+@@ -26,10 +32,23 @@ describe("InteractiveMode compaction events", () => {
+ 		) => void;
+ 
+ 		initTheme("dark");
+-		const enabled = {
+-			chatContainer: new Container(),
+-			settingsManager: { getShowCacheMissNotices: () => true },
++		const createContext = (showNotices: boolean) => {
++			const chatContainer = new Container();
++			return {
++				chatContainer,
++				transcriptPresentation: new TranscriptPresentation({
++					header: new Container(),
++					resources: new Container(),
++					transcript: chatContainer,
++					pendingOutput: new Container(),
++					getMarkdownTheme,
++					getOutputPad: () => 1,
++					getMarkdownTransformers: () => [],
++				}),
++				settingsManager: { getShowCacheMissNotices: () => showNotices },
++			};
+ 		};
++		const enabled = createContext(true);
+ 		addCompactionCostNotice.call(enabled, { type: "compaction_cost", kind: "compaction", usage });
+ 		addCompactionCostNotice.call(enabled, {
+ 			type: "compaction_cost",
+@@ -40,10 +59,7 @@ describe("InteractiveMode compaction events", () => {
+ 		expect(output).toContain("Compaction: 100 tokens billed (~$0.13)");
+ 		expect(output).toContain("Branch summary: 100 tokens billed (~$0.13)");
+ 
+-		const disabled = {
+-			chatContainer: new Container(),
+-			settingsManager: { getShowCacheMissNotices: () => false },
+-		};
++		const disabled = createContext(false);
+ 		addCompactionCostNotice.call(disabled, { type: "compaction_cost", kind: "compaction", usage });
+ 		expect(disabled.chatContainer.children).toHaveLength(0);
+ 	});
+@@ -87,7 +103,11 @@ describe("InteractiveMode compaction events", () => {
+ 				usage: previousUsage,
+ 			},
+ 		];
+-		const fakeThis = { renderSessionItems: vi.fn() };
++		const fakeThis = {
++			pendingBashComponents: new Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">(),
++			pendingMessagesContainer: new Container(),
++			renderSessionItems: vi.fn(),
++		};
+ 		const renderSessionEntries = Reflect.get(InteractiveMode.prototype, "renderSessionEntries") as (
+ 			this: typeof fakeThis,
+ 			entries: SessionEntry[],
+@@ -98,11 +118,11 @@ describe("InteractiveMode compaction events", () => {
+ 		expect(fakeThis.renderSessionItems).toHaveBeenCalledWith(
+ 			[
+ 				expect.objectContaining({ role: "compactionSummary", summary: "current summary" }),
+-				{ type: "compaction_cost", kind: "compaction", usage: currentUsage },
++				{ type: "compaction_cost", kind: "compaction", usage: currentUsage, intent: "background" },
+ 				expect.objectContaining({ role: "compactionSummary", summary: "previous summary" }),
+-				{ type: "compaction_cost", kind: "compaction", usage: previousUsage },
++				{ type: "compaction_cost", kind: "compaction", usage: previousUsage, intent: "background" },
+ 			],
+-			{},
++			{ explicitBranchSummary: undefined },
+ 		);
+ 	});
+ 
+@@ -189,12 +209,12 @@ describe("InteractiveMode compaction events", () => {
+ 				tokensBefore: 123,
+ 				summary: "summary",
+ 			}),
++			{ intent: "background" },
++		);
++		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith(
++			{ type: "compaction_cost", kind: "compaction", usage },
++			"background",
+ 		);
+-		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith({
+-			type: "compaction_cost",
+-			kind: "compaction",
+-			usage,
+-		});
+ 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+ 	});
+ 
+diff --git a/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts b/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
+index ea663d9dd..3eedd6248 100644
+--- a/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
++++ b/packages/coding-agent/test/interactive-mode-focus-lifecycle.test.ts
+@@ -1,3 +1,6 @@
++import { existsSync, mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ import type { AgentTool } from "@earendil-works/pi-agent-core";
+ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
+ import { Type } from "typebox";
+@@ -18,6 +21,14 @@ async function screen(terminal: VirtualTerminal) {
+ 	return terminal.getViewport().join("\n");
+ }
+ 
++function deferred() {
++	let resolve = () => {};
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++
+ async function setup(options: HarnessOptions = {}) {
+ 	const harnesses: Harness[] = [];
+ 	const initial = await createHarness({
+@@ -63,6 +74,381 @@ async function setup(options: HarnessOptions = {}) {
+ }
+ 
+ describe("focus lifecycle", () => {
++	it.each([false, true])(
++		"rejects new manual commands during replacement construction, preserves their draft, then permits retry (intercepted=%s)",
++		async (intercepted) => {
++			const replacementStarted = deferred();
++			const replacementRelease = deferred();
++			let factories = 0;
++			let interceptions = 0;
++			const test = await setup({
++				settings: { quietStartup: true },
++				extensionFactories: [
++					async (pi) => {
++						if (++factories === 2) {
++							replacementStarted.resolve();
++							await replacementRelease.promise;
++						}
++						if (intercepted)
++							pi.on("user_bash", () => {
++								interceptions++;
++								return {
++									result: { output: "construction output", exitCode: 0, cancelled: false, truncated: false },
++								};
++							});
++					},
++				],
++			});
++			const marker = join(test.initial.tempDir, "construction-marker");
++			const command = intercepted
++				? "held-window-command"
++				: `printf 'construction output\\n'; printf marker > '${marker}'`;
++			const draftPrefix = intercepted ? "!held-window-command" : "!printf 'construction output";
++			try {
++				await test.mode.init();
++				submit(test.terminal, "/focus");
++				submit(test.terminal, "/new");
++				await replacementStarted.promise;
++				submit(test.terminal, `!${command}`);
++				await vi.waitFor(async () =>
++					expect(await screen(test.terminal)).toContain("Session replacement is still in progress"),
++				);
++				const output = await screen(test.terminal);
++				expect(output).toContain("Retry this command after it finishes");
++				expect(output).toContain(draftPrefix);
++				expect(interceptions).toBe(0);
++				expect(existsSync(marker)).toBe(false);
++				expect(test.initial.session.messages).toEqual([]);
++				replacementRelease.resolve();
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
++				expect(await screen(test.terminal)).toContain(draftPrefix);
++				expect(test.current().session.messages).toEqual([]);
++				test.terminal.sendInput("\r"); // Retry the preserved draft only after the new session is ready.
++				await vi.waitFor(() =>
++					expect(test.current().session.messages).toEqual([
++						expect.objectContaining({
++							role: "bashExecution",
++							command,
++							output: intercepted ? "construction output" : "construction output\n",
++						}),
++					]),
++				);
++				expect(
++					(await screen(test.terminal)).split("\n").filter((line) => line.trim() === "construction output"),
++				).toHaveLength(1);
++				expect(interceptions).toBe(intercepted ? 1 : 0);
++				expect(existsSync(marker)).toBe(!intercepted);
++				expect(test.initial.session.messages).toEqual([]);
++				expect(test.current().faux.state.callCount).toBe(0);
++			} finally {
++				replacementRelease.resolve();
++				await screen(test.terminal);
++				test.cleanup();
++			}
++		},
++	);
++
++	it("discards an old interception error during replacement construction, before the new session is applied", async () => {
++		const interceptionStarted = deferred();
++		const interceptionRelease = deferred();
++		const replacementStarted = deferred();
++		const replacementRelease = deferred();
++		let factoryRuns = 0;
++		const test = await setup({
++			settings: { quietStartup: true },
++			extensionFactories: [
++				async (pi) => {
++					if (++factoryRuns === 2) {
++						replacementStarted.resolve();
++						await replacementRelease.promise;
++					}
++					pi.on("user_bash", async () => {
++						interceptionStarted.resolve();
++						await interceptionRelease.promise;
++						throw new Error("invalidated interception error");
++					});
++				},
++			],
++		});
++		try {
++			await test.mode.init();
++			submit(test.terminal, "!invalidated command");
++			await interceptionStarted.promise;
++			submit(test.terminal, "/new");
++			await replacementStarted.promise;
++			interceptionRelease.resolve();
++			expect(await screen(test.terminal)).not.toContain("invalidated interception error");
++			replacementRelease.resolve();
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
++			expect(await screen(test.terminal)).not.toContain("invalidated interception error");
++			expect(test.current().session.messages).toEqual([]);
++		} finally {
++			interceptionRelease.resolve();
++			replacementRelease.resolve();
++			await screen(test.terminal);
++			test.cleanup();
++		}
++	});
++
++	it("ignores late old execution callbacks while a new session's manual command is streaming", async () => {
++		const oldStarted = deferred();
++		const oldRelease = deferred();
++		const nextStarted = deferred();
++		const nextRelease = deferred();
++		const executions: string[] = [];
++		const test = await setup({
++			settings: { quietStartup: true },
++			extensionFactories: [
++				(pi) => {
++					pi.on("user_bash", () => ({
++						operations: {
++							exec: async (command, _cwd, { onData }) => {
++								executions.push(command);
++								if (command === "old execution") {
++									onData(Buffer.from("old initial chunk\n"));
++									oldStarted.resolve();
++									await oldRelease.promise; // Deliberately model a remote callback arriving after cancellation.
++									onData(Buffer.from("late old execution chunk\n"));
++									return { exitCode: 17 };
++								}
++								onData(Buffer.from("new initial chunk\n"));
++								nextStarted.resolve();
++								await nextRelease.promise;
++								onData(Buffer.from("new final chunk\n"));
++								return { exitCode: 0 };
++							},
++						},
++					}));
++				},
++			],
++		});
++		try {
++			await test.mode.init();
++			submit(test.terminal, "/focus");
++			submit(test.terminal, "!old execution");
++			await oldStarted.promise;
++			submit(test.terminal, "/new");
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
++			submit(test.terminal, "!new execution");
++			await nextStarted.promise;
++			oldRelease.resolve();
++			let output = await screen(test.terminal);
++			expect(output).toContain("new initial chunk");
++			expect(output).not.toContain("late old execution chunk");
++			nextRelease.resolve();
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new final chunk"));
++			for (let view = 0; view < 2; view++) {
++				output = await screen(test.terminal);
++				expect(output).toContain("new initial chunk");
++				expect(output).toContain("new final chunk");
++				expect(output).not.toContain("old initial chunk");
++				expect(output).not.toContain("late old execution chunk");
++				expect(output).not.toContain("exit code 17");
++				submit(test.terminal, "/focus");
++			}
++			expect(executions).toEqual(["old execution", "new execution"]);
++			expect(test.current().session.messages).toEqual([
++				expect.objectContaining({
++					role: "bashExecution",
++					command: "new execution",
++					output: "new initial chunk\nnew final chunk\n",
++					exitCode: 0,
++				}),
++			]);
++		} finally {
++			oldRelease.resolve();
++			nextRelease.resolve();
++			await screen(test.terminal);
++			test.cleanup();
++		}
++	});
++
++	it.each(["result", "operations", "rejection"] as const)(
++		"discards stale manual interception %s after native session replacement",
++		async (path) => {
++			const started = deferred();
++			const release = deferred();
++			let oldExecutions = 0;
++			const test = await setup({
++				settings: { quietStartup: true },
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", async ({ command }) => {
++							if (command === "old held command") {
++								started.resolve();
++								await release.promise;
++								if (path === "rejection") throw new Error("stale interception rejection");
++								if (path === "operations")
++									return {
++										operations: {
++											exec: async (_command, _cwd, { onData }) => {
++												oldExecutions++;
++												onData(Buffer.from("stale manual output\n"));
++												return { exitCode: 0 };
++											},
++										},
++									};
++								return {
++									result: { output: "stale manual output", exitCode: 0, cancelled: false, truncated: false },
++								};
++							}
++							return {
++								result: {
++									output: "new session manual output",
++									exitCode: 0,
++									cancelled: false,
++									truncated: false,
++								},
++							};
++						});
++					},
++				],
++			});
++			try {
++				await test.mode.init();
++				submit(test.terminal, "/focus");
++				submit(test.terminal, "!old held command");
++				await started.promise;
++				submit(test.terminal, "/new");
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
++				release.resolve();
++				let output = await screen(test.terminal);
++				expect(output).not.toContain("stale manual output");
++				expect(output).not.toContain("stale interception rejection");
++				submit(test.terminal, "/focus");
++				output = await screen(test.terminal);
++				expect(output).not.toContain("old held command");
++				expect(output).not.toContain("stale interception rejection");
++				expect(oldExecutions).toBe(0);
++				expect(test.initial.session.messages).toEqual([]);
++				expect(test.current().session.messages).toEqual([]);
++				submit(test.terminal, "!!new command");
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new session manual output"));
++				expect(test.current().session.messages).toEqual([
++					expect.objectContaining({ role: "bashExecution", command: "new command", excludeFromContext: true }),
++				]);
++				expect(test.current().faux.state.callCount).toBe(0);
++			} finally {
++				release.resolve();
++				await screen(test.terminal);
++				test.cleanup();
++			}
++		},
++	);
++
++	it("releases the old reservation on replacement without letting its finally clear a newer interception", async () => {
++		const oldStarted = deferred();
++		const oldRelease = deferred();
++		const nextStarted = deferred();
++		const nextRelease = deferred();
++		const interceptions: string[] = [];
++		const test = await setup({
++			settings: { quietStartup: true },
++			extensionFactories: [
++				(pi) => {
++					pi.on("user_bash", async ({ command }) => {
++						interceptions.push(command);
++						if (command === "old reservation") {
++							oldStarted.resolve();
++							await oldRelease.promise;
++						}
++						if (command === "new reservation") {
++							nextStarted.resolve();
++							await nextRelease.promise;
++						}
++						return { result: { output: `${command} output`, exitCode: 0, cancelled: false, truncated: false } };
++					});
++				},
++			],
++		});
++		try {
++			await test.mode.init();
++			submit(test.terminal, "/focus");
++			submit(test.terminal, "!old reservation");
++			await oldStarted.promise;
++			submit(test.terminal, "/new");
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("New session started"));
++			submit(test.terminal, "!new reservation");
++			await vi.waitFor(() => expect(interceptions).toEqual(["old reservation", "new reservation"]));
++			await nextStarted.promise;
++			oldRelease.resolve();
++			expect(await screen(test.terminal)).not.toContain("old reservation output");
++			submit(test.terminal, "!overlapping reservation");
++			expect(await screen(test.terminal)).toContain("A bash command is already running");
++			expect(interceptions).toEqual(["old reservation", "new reservation"]);
++			nextRelease.resolve();
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("new reservation output"));
++			expect(test.current().session.messages).toEqual([expect.objectContaining({ command: "new reservation" })]);
++			test.terminal.sendInput("\x15"); // Clear the natively preserved rejected-command draft.
++			submit(test.terminal, "!after reservation");
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("after reservation output"));
++			expect(interceptions).toEqual(["old reservation", "new reservation", "after reservation"]);
++		} finally {
++			oldRelease.resolve();
++			nextRelease.resolve();
++			await screen(test.terminal);
++			test.cleanup();
++		}
++	});
++
++	it.each(["native", "extension"] as const)(
++		"routes resume completion by its %s invocation origin while retaining focus",
++		async (origin) => {
++			const directory = mkdtempSync(join(tmpdir(), "pi-focus-resume-origin-"));
++			const initialManager = SessionManager.create(directory, directory);
++			initialManager.appendMessage({ role: "user", content: "initial resume user", timestamp: 1 });
++			const selected = SessionManager.create(directory, directory);
++			selected.appendMessage({ role: "user", content: "selected resume user", timestamp: 2 });
++			selected.appendMessage(fauxAssistantMessage("selected resume answer"));
++			selected.appendSessionInfo("selected resume session");
++			const selectedPath = selected.getSessionFile()!;
++			const test = await setup({
++				sessionManager: initialManager,
++				settings: { quietStartup: true },
++				extensionFactories: [
++					(pi) => {
++						pi.registerCommand("extension-resume", {
++							description: "Offline extension resume",
++							handler: async (_args, ctx) => {
++								await ctx.switchSession(selectedPath);
++							},
++						});
++					},
++				],
++			});
++			try {
++				await test.mode.init();
++				submit(test.terminal, "/focus");
++				if (origin === "native") {
++					submit(test.terminal, "/resume");
++					await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("selected resume session"));
++					test.terminal.sendInput("selected resume session");
++					test.terminal.sendInput("\r");
++					await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Resumed session"));
++				} else {
++					await test.initial.session.prompt("/extension-resume");
++				}
++				expect(test.runtime.session.sessionFile).toBe(selectedPath);
++				let output = await screen(test.terminal);
++				expect(output).toContain("selected resume user");
++				expect(output).toContain("selected resume answer");
++				expect(output).not.toContain("initial resume user");
++				if (origin === "native") expect(output).toContain("Resumed session");
++				else expect(output).not.toContain("Resumed session");
++				test.mode.showWarning("resume background diagnostic");
++				expect(await screen(test.terminal)).not.toContain("resume background diagnostic");
++				submit(test.terminal, "/focus");
++				output = await screen(test.terminal);
++				expect(output).toContain("Resumed session");
++				expect(output).toContain("resume background diagnostic");
++				expect(test.initial.faux.state.callCount).toBe(0);
++				expect(test.current().faux.state.callCount).toBe(0);
++			} finally {
++				test.cleanup();
++				rmSync(directory, { recursive: true });
++			}
++		},
++	);
+ 	it("shows transformed user and assistant completions once before persistence and after reconciliation", async () => {
+ 		const test = await setup({
+ 			extensionFactories: [
+diff --git a/packages/coding-agent/test/interactive-mode-focus-output.test.ts b/packages/coding-agent/test/interactive-mode-focus-output.test.ts
+new file mode 100644
+index 000000000..2331ad1fc
+--- /dev/null
++++ b/packages/coding-agent/test/interactive-mode-focus-output.test.ts
+@@ -0,0 +1,963 @@
++import { existsSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import type { AgentTool } from "@earendil-works/pi-agent-core";
++import {
++	type FauxProviderRegistration,
++	fauxAssistantMessage,
++	fauxToolCall,
++	registerFauxProvider,
++} from "@earendil-works/pi-ai/compat";
++import { Text } from "@earendil-works/pi-tui";
++import { Type } from "typebox";
++import { describe, expect, it, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { createHarness, type HarnessOptions } from "./suite/harness.ts";
++
++function submit(terminal: VirtualTerminal, text: string) {
++	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
++	terminal.sendInput("\r");
++}
++
++async function screen(terminal: VirtualTerminal) {
++	await terminal.waitForRender();
++	return terminal.getViewport().join("\n");
++}
++
++function deferred() {
++	let resolve = () => {};
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++
++async function setup(options: HarnessOptions = {}) {
++	const harness = await createHarness({
++		...options,
++		settings: { theme: "dark", quietStartup: true, showCacheMissNotices: false, ...options.settings },
++	});
++	const runtime = new AgentSessionRuntime(
++		harness.session,
++		{
++			cwd: harness.tempDir,
++			agentDir: harness.tempDir,
++			modelRuntime: harness.session.modelRuntime,
++			settingsManager: harness.settingsManager,
++			resourceLoader: harness.session.resourceLoader,
++			diagnostics: [],
++		},
++		async () => {
++			throw new Error("Session replacement is not part of this test");
++		},
++	);
++	writeFileSync(
++		join(harness.tempDir, "keybindings.json"),
++		JSON.stringify({ "app.transcript.toggleFinalOnly": ["f6"], "app.message.followUp": ["f7"] }),
++	);
++	vi.stubEnv("PI_CODING_AGENT_DIR", harness.tempDir);
++	const terminal = new VirtualTerminal(120, 100);
++	const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
++	await mode.init();
++	return {
++		harness,
++		terminal,
++		mode,
++		cleanup: () => {
++			mode.stop("resume-hint");
++			harness.cleanup();
++			vi.unstubAllEnvs();
++		},
++	};
++}
++
++describe("explicit native output in focus", () => {
++	it.each([
++		{ path: "idle", focused: false },
++		{ path: "idle", focused: true },
++		{ path: "flushed", focused: false },
++		{ path: "flushed", focused: true },
++	] as const)(
++		"preserves mounted active $path bash through reload in native order (focus=$focused)",
++		async ({ path, focused }) => {
++			const toolStarted = deferred();
++			const toolRelease = deferred();
++			const bashStarted = deferred();
++			const bashRelease = deferred();
++			let executions = 0;
++			const tool: AgentTool = {
++				name: "hold",
++				label: "Hold",
++				description: "Offline held tool",
++				parameters: Type.Object({}),
++				execute: async () => {
++					toolStarted.resolve();
++					await toolRelease.promise;
++					return { content: [{ type: "text", text: "held mounted tool result" }], details: {} };
++				},
++			};
++			const test = await setup({
++				tools: [tool],
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", () => ({
++							operations: {
++								exec: async (_command, _cwd, { onData }) => {
++									executions++;
++									onData(Buffer.from("mounted active chunk\n"));
++									bashStarted.resolve();
++									await bashRelease.promise;
++									onData(Buffer.from("mounted final chunk\n"));
++									return { exitCode: 0 };
++								},
++							},
++						}));
++					},
++				],
++			});
++			let prompt: Promise<void> | undefined;
++			try {
++				test.harness.setResponses(
++					path === "flushed"
++						? [
++								fauxAssistantMessage([fauxToolCall("hold", {})], { stopReason: "toolUse" }),
++								fauxAssistantMessage("answer before mounted flush"),
++								fauxAssistantMessage("later mounted answer"),
++							]
++						: [fauxAssistantMessage("later mounted answer")],
++				);
++				if (focused) submit(test.terminal, "/focus");
++				if (path === "flushed") {
++					prompt = test.harness.session.prompt("user before mounted flush");
++					await toolStarted.promise;
++				}
++				submit(test.terminal, "!!mounted manual command");
++				await bashStarted.promise;
++				if (path === "flushed") {
++					toolRelease.resolve();
++					await prompt;
++				}
++				submit(test.terminal, "later mounted user");
++				expect(await test.mode.getUserInput()).toBe("later mounted user");
++				await test.harness.session.prompt("later mounted user");
++				let output = await screen(test.terminal);
++				expect(output.indexOf("mounted active chunk")).toBeLessThan(output.indexOf("later mounted user"));
++				const records = structuredClone(test.harness.sessionManager.getEntries());
++				submit(test.terminal, "/reload");
++				await vi.waitFor(async () =>
++					expect(await screen(test.terminal)).toContain("Reloaded keybindings, extensions"),
++				);
++				expect(test.harness.session.isBashRunning).toBe(true);
++				expect(test.harness.sessionManager.getEntries()).toEqual(records);
++				for (let view = 0; view < 2; view++) {
++					output = await screen(test.terminal);
++					expect(output.split("\n").filter((line) => line.trim() === "mounted active chunk")).toHaveLength(1);
++					expect(output.indexOf("mounted active chunk")).toBeLessThan(output.indexOf("later mounted user"));
++					expect(output.indexOf("later mounted user")).toBeLessThan(output.indexOf("later mounted answer"));
++					if (path === "flushed")
++						expect(output.indexOf("answer before mounted flush")).toBeLessThan(
++							output.indexOf("mounted active chunk"),
++						);
++					submit(test.terminal, "/focus");
++				}
++				bashRelease.resolve();
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("mounted final chunk"));
++				for (let view = 0; view < 2; view++) {
++					output = await screen(test.terminal);
++					expect(output.split("\n").filter((line) => line.trim() === "mounted active chunk")).toHaveLength(1);
++					expect(output.split("\n").filter((line) => line.trim() === "mounted final chunk")).toHaveLength(1);
++					expect(output.indexOf("mounted final chunk")).toBeLessThan(output.indexOf("later mounted user"));
++					submit(test.terminal, "/focus");
++				}
++				expect(executions).toBe(1);
++				expect(test.harness.session.messages.filter((message) => message.role === "bashExecution")).toEqual([
++					expect.objectContaining({ command: "mounted manual command", excludeFromContext: true }),
++				]);
++			} finally {
++				bashRelease.resolve();
++				toolRelease.resolve();
++				await prompt;
++				await screen(test.terminal);
++				test.cleanup();
++			}
++		},
++	);
++
++	it.each([false, true])("preserves active deferred bash across reload and submission (focus=%s)", async (focused) => {
++		const toolStarted = deferred();
++		const toolRelease = deferred();
++		const bashStarted = deferred();
++		const bashRelease = deferred();
++		const tool: AgentTool = {
++			name: "hold",
++			label: "Hold",
++			description: "Offline held tool",
++			parameters: Type.Object({}),
++			execute: async () => {
++				toolStarted.resolve();
++				await toolRelease.promise;
++				return { content: [{ type: "text", text: "held result" }], details: {} };
++			},
++		};
++		const test = await setup({
++			tools: [tool],
++			extensionFactories: [
++				(pi) => {
++					pi.on("user_bash", () => ({
++						operations: {
++							exec: async (_command, _cwd, { onData }) => {
++								onData(Buffer.from("active dock chunk\n"));
++								bashStarted.resolve();
++								await bashRelease.promise;
++								onData(Buffer.from("completed dock tail\n"));
++								return { exitCode: 0 };
++							},
++						},
++					}));
++				},
++			],
++		});
++		let prompt: Promise<void> | undefined;
++		try {
++			test.harness.setResponses([
++				fauxAssistantMessage([fauxToolCall("hold", {})], { stopReason: "toolUse" }),
++				fauxAssistantMessage("answer before active reload"),
++			]);
++			if (focused) submit(test.terminal, "/focus");
++			prompt = test.harness.session.prompt("user before active reload");
++			await toolStarted.promise;
++			submit(test.terminal, "!!active dock command");
++			await bashStarted.promise;
++			toolRelease.resolve();
++			await prompt;
++			submit(test.terminal, "/reload");
++			await vi.waitFor(async () =>
++				expect(await screen(test.terminal)).toContain("Reloaded keybindings, extensions"),
++			);
++			expect(test.harness.session.isBashRunning).toBe(true);
++			expect(
++				(await screen(test.terminal)).split("\n").filter((line) => line.trim() === "active dock chunk"),
++			).toHaveLength(1);
++			bashRelease.resolve();
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("completed dock tail"));
++			submit(test.terminal, "user after active reload");
++			expect(await test.mode.getUserInput()).toBe("user after active reload");
++			for (let view = 0; view < 2; view++) {
++				const output = await screen(test.terminal);
++				expect(output.split("\n").filter((line) => line.trim() === "active dock chunk")).toHaveLength(1);
++				expect(output.split("\n").filter((line) => line.trim() === "completed dock tail")).toHaveLength(1);
++				expect(output.indexOf("answer before active reload")).toBeLessThan(output.indexOf("active dock chunk"));
++				submit(test.terminal, "/focus");
++			}
++			expect(test.harness.session.messages.filter((message) => message.role === "bashExecution")).toEqual([
++				expect.objectContaining({ command: "active dock command", excludeFromContext: true }),
++			]);
++		} finally {
++			bashRelease.resolve();
++			toolRelease.resolve();
++			await prompt;
++			await screen(test.terminal);
++			test.cleanup();
++		}
++	});
++
++	it.each([false, true])(
++		"reconciles completed deferred bash across reload and submission (focus=%s)",
++		async (focused) => {
++			const started = deferred();
++			const release = deferred();
++			const tool: AgentTool = {
++				name: "hold",
++				label: "Hold",
++				description: "Offline held tool",
++				parameters: Type.Object({}),
++				execute: async () => {
++					started.resolve();
++					await release.promise;
++					return { content: [{ type: "text", text: "held agent tool result" }], details: {} };
++				},
++			};
++			const test = await setup({
++				tools: [tool],
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", () => ({
++							result: { output: "completed dock output", exitCode: 0, cancelled: false, truncated: false },
++						}));
++					},
++				],
++			});
++			let prompt: Promise<void> | undefined;
++			let reloadedFaux: FauxProviderRegistration | undefined;
++			try {
++				test.harness.setResponses([
++					fauxAssistantMessage([fauxToolCall("hold", {})], { stopReason: "toolUse" }),
++					fauxAssistantMessage("answer before reload"),
++				]);
++				if (focused) submit(test.terminal, "/focus");
++				prompt = test.harness.session.prompt("user before reload");
++				await started.promise;
++				submit(test.terminal, "!completed dock command");
++				await vi.waitFor(() => expect(test.harness.session.hasPendingBashMessages).toBe(true));
++				release.resolve();
++				await prompt;
++				const records = structuredClone(test.harness.sessionManager.getEntries());
++				submit(test.terminal, "/reload");
++				await vi.waitFor(async () =>
++					expect(await screen(test.terminal)).toContain("Reloaded keybindings, extensions"),
++				);
++				let output = await screen(test.terminal);
++				expect(output.split("\n").filter((line) => line.trim() === "completed dock output")).toHaveLength(1);
++				expect(test.harness.sessionManager.getEntries()).toEqual(records);
++				submit(test.terminal, "user after reload");
++				expect(await test.mode.getUserInput()).toBe("user after reload");
++				// Reload clears temporary API registrations. Re-register a faux provider for this turn.
++				reloadedFaux = registerFauxProvider();
++				await test.harness.session.setModel(reloadedFaux.getModel());
++				reloadedFaux.setResponses([fauxAssistantMessage("answer after reload")]);
++				await test.harness.session.prompt("user after reload");
++				for (let view = 0; view < 2; view++) {
++					output = await screen(test.terminal);
++					expect(output).toContain("answer after reload");
++					expect(output.split("\n").filter((line) => line.trim() === "completed dock output")).toHaveLength(1);
++					expect(output.indexOf("answer before reload")).toBeLessThan(output.indexOf("completed dock output"));
++					expect(output.indexOf("completed dock output")).toBeLessThan(output.indexOf("user after reload"));
++					expect(output.indexOf("user after reload")).toBeLessThan(output.indexOf("answer after reload"));
++					submit(test.terminal, "/focus");
++				}
++				expect(test.harness.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(1);
++			} finally {
++				release.resolve();
++				await prompt;
++				reloadedFaux?.unregister();
++				test.cleanup();
++			}
++		},
++	);
++
++	it.each(["native", "extension"] as const)("routes reload completion by its %s invocation origin", async (origin) => {
++		let reloads = 0;
++		const test = await setup({
++			extensionFactories: [
++				(pi) => {
++					pi.registerCommand("extension-reload", {
++						description: "Offline extension reload",
++						handler: async (_args, ctx) => {
++							await ctx.reload();
++						},
++					});
++					pi.on("session_start", (event, ctx) => {
++						if (event.reason === "reload") {
++							reloads++;
++							ctx.ui.setStatus("reload", "reload lifecycle complete");
++						}
++					});
++				},
++			],
++		});
++		try {
++			submit(test.terminal, "/focus");
++			if (origin === "native") {
++				submit(test.terminal, "/reload");
++				await vi.waitFor(async () =>
++					expect(await screen(test.terminal)).toContain("Reloaded keybindings, extensions"),
++				);
++			} else {
++				await test.harness.session.prompt("/extension-reload");
++			}
++			expect(reloads).toBe(1);
++			let output = await screen(test.terminal);
++			expect(output).toContain("reload lifecycle complete");
++			if (origin === "native") expect(output).toContain("Reloaded keybindings, extensions");
++			else expect(output).not.toContain("Reloaded keybindings, extensions");
++			submit(test.terminal, "/focus");
++			output = await screen(test.terminal);
++			expect(output).toContain("Reloaded keybindings, extensions");
++			expect(test.harness.faux.state.callCount).toBe(0);
++			expect(test.harness.session.messages).toEqual([]);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it.each(["native", "extension"] as const)(
++		"preserves only newly requested native tree summary output (%s origin)",
++		async (origin) => {
++			let targetId = "";
++			const test = await setup({
++				settings: { showCacheMissNotices: true },
++				extensionFactories: [
++					(pi) => {
++						pi.registerCommand("extension-tree", {
++							description: "Offline extension navigation",
++							handler: async (_args, ctx) => {
++								await ctx.navigateTree(targetId, { summarize: true });
++							},
++						});
++						pi.on("session_before_tree", () => ({
++							summary: {
++								summary: "new branch summary",
++								usage: { ...fauxAssistantMessage("offline usage").usage, input: 1234 },
++							},
++						}));
++					},
++				],
++			});
++			try {
++				const manager = test.harness.sessionManager;
++				const root = manager.appendMessage({ role: "user", content: "tree root", timestamp: 1 });
++				manager.branchWithSummary(root, "historical branch summary", undefined, true, {
++					...fauxAssistantMessage("offline usage").usage,
++					input: 2345,
++				});
++				targetId = manager.appendMessage(fauxAssistantMessage("tree target answer"));
++				manager.appendMessage({ role: "user", content: "departing branch user", timestamp: 2 });
++				manager.appendMessage(fauxAssistantMessage("departing branch answer"));
++				test.harness.session.refreshContext();
++				test.mode.renderInitialMessages();
++				submit(test.terminal, "/focus");
++				if (origin === "native") {
++					submit(test.terminal, "/tree");
++					test.terminal.sendInput("tree target answer");
++					test.terminal.sendInput("\r");
++					expect(await screen(test.terminal)).toContain("Summarize branch?");
++					test.terminal.sendInput("\x1b[B");
++					test.terminal.sendInput("\r");
++					await vi.waitFor(async () =>
++						expect(await screen(test.terminal)).toContain("Navigated to selected point"),
++					);
++				} else {
++					await test.harness.session.prompt("/extension-tree");
++				}
++				test.terminal.sendInput("\x0f");
++				let output = await screen(test.terminal);
++				if (origin === "native") {
++					expect(output).toContain("new branch summary");
++					expect(output).toContain("Branch summary: 1.2k tokens billed");
++				} else {
++					expect(output).not.toContain("new branch summary");
++					expect(output).not.toContain("Branch summary: 1.2k tokens billed");
++				}
++				expect(output).not.toContain("historical branch summary");
++				expect(output).not.toContain("Branch summary: 2.3k tokens billed");
++				expect(output).not.toContain("departing branch answer");
++				submit(test.terminal, "/focus");
++				output = await screen(test.terminal);
++				expect(output.match(/new branch summary/g)).toHaveLength(1);
++				expect(output).toContain("historical branch summary");
++				expect(output).toContain("Branch summary: 1.2k tokens billed");
++				expect(output).toContain("Branch summary: 2.3k tokens billed");
++				expect(test.harness.faux.state.callCount).toBe(0);
++			} finally {
++				test.cleanup();
++			}
++		},
++	);
++	it("preserves an extension dialog and editor restoration during manual bash interception", async () => {
++		const started = deferred();
++		const test = await setup({
++			extensionFactories: [
++				(pi) => {
++					pi.on("user_bash", async (_event, ctx) => {
++						started.resolve();
++						const choice = await ctx.ui.select("Route the manual command?", ["Route", "Cancel"]);
++						return {
++							result: {
++								output: choice === "Route" ? "dialog-routed output" : "declined route",
++								exitCode: 0,
++								cancelled: choice !== "Route",
++								truncated: false,
++							},
++						};
++					});
++				},
++			],
++		});
++		try {
++			submit(test.terminal, "/focus");
++			submit(test.terminal, "!route via dialog");
++			await started.promise;
++			expect(await screen(test.terminal)).toContain("Route the manual command?");
++			test.terminal.sendInput("\r");
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("dialog-routed output"));
++			test.terminal.sendInput("\x1b[200~restored editor draft\x1b[201~");
++			test.terminal.sendInput("\x1b[17~");
++			expect(await screen(test.terminal)).toContain("restored editor draft");
++			test.terminal.sendInput("\x1b[17~");
++			const output = await screen(test.terminal);
++			expect(output).toContain("restored editor draft");
++			expect(output).toContain("dialog-routed output");
++			expect(test.harness.faux.state.callCount).toBe(0);
++			expect(test.harness.session.pendingMessageCount).toBe(0);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it("preserves native compact completion output without restoring summaries from unsolicited compaction", async () => {
++		const test = await setup({
++			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 }, showCacheMissNotices: true },
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_before_compact", ({ preparation }) => ({
++						compaction: {
++							summary: "explicit native compact summary",
++							firstKeptEntryId: preparation.firstKeptEntryId,
++							tokensBefore: preparation.tokensBefore,
++							usage: { ...fauxAssistantMessage("offline usage").usage, input: 1234 },
++						},
++					}));
++				},
++			],
++		});
++		try {
++			test.harness.sessionManager.appendMessage({ role: "user", content: "compact this", timestamp: 1 });
++			test.harness.sessionManager.appendMessage(fauxAssistantMessage("old answer"));
++			test.harness.session.refreshContext();
++			test.mode.renderInitialMessages();
++			submit(test.terminal, "/focus");
++			submit(test.terminal, "/compact");
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("[compaction]"));
++			expect(await screen(test.terminal)).toContain("Compaction: 1.2k tokens billed");
++			test.terminal.sendInput("\x0f"); // Native expansion still operates on the shared component.
++			expect(await screen(test.terminal)).toContain("explicit native compact summary");
++			submit(test.terminal, "/focus");
++			expect((await screen(test.terminal)).match(/explicit native compact summary/g)).toHaveLength(1);
++			expect(test.harness.faux.state.callCount).toBe(0);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it("fails closed when asynchronous interception throws, with visible native failure output", async () => {
++		const release = deferred();
++		const started = deferred();
++		let interceptions = 0;
++		const test = await setup({
++			extensionFactories: [
++				(pi) => {
++					pi.on("user_bash", async () => {
++						interceptions++;
++						started.resolve();
++						await release.promise;
++						throw new Error("interception rejected");
++					});
++				},
++			],
++		});
++		try {
++			const marker = join(test.harness.tempDir, "must-not-execute");
++			submit(test.terminal, "/focus");
++			submit(test.terminal, `!printf fallback > '${marker}'`);
++			await started.promise;
++			test.terminal.sendInput("\x1b[17~");
++			test.terminal.sendInput("\x1b[17~");
++			release.resolve();
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("interception rejected"));
++			expect(existsSync(marker)).toBe(false);
++			expect(test.harness.session.messages).toEqual([]);
++			expect(test.harness.faux.state.callCount).toBe(0);
++			submit(test.terminal, "!!printf 'next manual command\\n'");
++			// The same rejecting interceptor handles the second command: reservation must have cleared.
++			await vi.waitFor(() => expect(interceptions).toBe(2));
++			expect(await screen(test.terminal)).not.toContain("A bash command is already running");
++		} finally {
++			release.resolve();
++			test.cleanup();
++		}
++	});
++
++	it("keeps native status output intact when unrelated extension notifications follow it", async () => {
++		const test = await setup({
++			extensionFactories: [
++				(pi) => {
++					pi.registerCommand("background-notice", {
++						description: "Offline extension notice",
++						handler: async (_args, ctx) => {
++							ctx.ui.notify("unsolicited replacement status");
++						},
++					});
++				},
++			],
++		});
++		try {
++			submit(test.terminal, "/focus");
++			submit(test.terminal, `/export ${join(test.harness.tempDir, "export.jsonl")}`);
++			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Session exported to:"));
++			await test.harness.session.prompt("/background-notice");
++			let output = await screen(test.terminal);
++			expect(output).toContain("Session exported to:");
++			expect(output).not.toContain("unsolicited replacement status");
++			submit(test.terminal, "/focus");
++			output = await screen(test.terminal);
++			expect(output).toContain("Session exported to:");
++			expect(output).toContain("unsolicited replacement status");
++			expect(test.harness.faux.state.callCount).toBe(0);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it.each(["operations", "result"] as const)(
++		"retains deferred %s bash alongside queue controls while hiding agent tools and extension transcript output",
++		async (path) => {
++			const toolStarted = deferred();
++			const toolRelease = deferred();
++			const bashStarted = deferred();
++			const bashRelease = deferred();
++			const tool: AgentTool = {
++				name: "bash",
++				label: "Agent shell",
++				description: "Offline held shell tool",
++				parameters: Type.Object({}),
++				execute: async (_id, _args, _signal, onUpdate) => {
++					onUpdate?.({ content: [{ type: "text", text: "agent shell partial" }], details: {} });
++					toolStarted.resolve();
++					await toolRelease.promise;
++					return { content: [{ type: "text", text: "agent shell final" }], details: {} };
++				},
++			};
++			const test = await setup({
++				tools: [tool],
++				extensionFactories: [
++					(pi) => {
++						pi.on("session_start", () => {
++							pi.sendMessage(
++								{ customType: "background", content: "unsolicited extension message", display: true },
++								{ triggerTurn: false },
++							);
++						});
++						pi.on("user_bash", async (_event, ctx) => {
++							ctx.ui.notify("unsolicited extension notice");
++							if (path === "result") {
++								bashStarted.resolve();
++								await bashRelease.promise;
++								return {
++									result: {
++										output: "deferred manual output",
++										exitCode: 0,
++										cancelled: false,
++										truncated: false,
++									},
++								};
++							}
++							return {
++								operations: {
++									exec: async (_command, _cwd, { onData }) => {
++										onData(Buffer.from("deferred manual output\n"));
++										bashStarted.resolve();
++										await bashRelease.promise;
++										return { exitCode: 0 };
++									},
++								},
++							};
++						});
++					},
++				],
++			});
++			let prompt: Promise<void> | undefined;
++			try {
++				test.harness.setResponses([
++					fauxAssistantMessage([fauxToolCall("bash", {})], { stopReason: "toolUse" }),
++					fauxAssistantMessage("agent final answer"),
++					fauxAssistantMessage("follow-up answer"),
++				]);
++				submit(test.terminal, "/focus");
++				prompt = test.harness.session.prompt("user before manual bash");
++				await toolStarted.promise;
++				submit(test.terminal, "!!manual during tool");
++				await bashStarted.promise;
++				if (path === "result") bashRelease.resolve();
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("deferred manual output"));
++				test.terminal.sendInput("\x1b[200~queued follow-up\x1b[201~");
++				test.terminal.sendInput("\x1b[18~");
++				let output = await screen(test.terminal);
++				expect(output).toContain("Follow-up: queued follow-up");
++				expect(output).toContain("deferred manual output");
++				expect(output).not.toContain("agent shell partial");
++				expect(output).not.toContain("unsolicited extension notice");
++				expect(output).not.toContain("unsolicited extension message");
++				test.terminal.sendInput("\x1b[17~");
++				output = await screen(test.terminal);
++				for (const text of [
++					"agent shell partial",
++					"unsolicited extension notice",
++					"unsolicited extension message",
++					"deferred manual output",
++					"Follow-up: queued follow-up",
++				])
++					expect(output).toContain(text);
++				test.terminal.sendInput("\x1b[17~");
++				expect(await screen(test.terminal)).not.toContain("agent shell partial");
++				expect(test.harness.session.pendingMessageCount).toBe(1);
++				expect(test.harness.faux.state.callCount).toBe(1);
++				bashRelease.resolve();
++				await vi.waitFor(() => expect(test.harness.session.hasPendingBashMessages).toBe(true));
++				toolRelease.resolve();
++				await prompt;
++				output = await screen(test.terminal);
++				expect(output).toContain("agent final answer");
++				expect(output).toContain("follow-up answer");
++				expect(output).toContain("deferred manual output");
++				expect(output).not.toContain("agent shell final");
++				submit(test.terminal, "user after dock flush");
++				expect(await test.mode.getUserInput()).toBe("user after dock flush");
++				test.harness.setResponses([fauxAssistantMessage("answer after dock flush")]);
++				await test.harness.session.prompt("user after dock flush");
++				output = await screen(test.terminal);
++				expect(output.split("\n").filter((line) => line.trim() === "deferred manual output")).toHaveLength(1);
++				expect(output.indexOf("agent final answer")).toBeLessThan(output.indexOf("deferred manual output"));
++				expect(output.indexOf("deferred manual output")).toBeLessThan(output.indexOf("user after dock flush"));
++				expect(test.harness.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(1);
++				expect(test.harness.session.pendingMessageCount).toBe(0);
++			} finally {
++				bashRelease.resolve();
++				toolRelease.resolve();
++				await prompt;
++				test.cleanup();
++			}
++		},
++	);
++	it.each([false, true])(
++		"toggles during asynchronous interception (cancelled=%s) without accepting overlapping bash or submitting a draft",
++		async (cancelled) => {
++			const started = deferred();
++			const release = deferred();
++			let interceptions = 0;
++			const test = await setup({
++				extensionFactories: [
++					(pi) => {
++						pi.on("session_start", (_event, ctx) => {
++							ctx.ui.setHeader(() => new Text("extension header preserved", 0, 0));
++							ctx.ui.setWidget("test", ["extension widget preserved"]);
++							ctx.ui.setStatus("test", "extension status preserved");
++						});
++						pi.on("user_bash", async () => {
++							interceptions++;
++							started.resolve();
++							await release.promise;
++							return {
++								result: { output: "intercepted shell result", exitCode: 7, cancelled, truncated: false },
++							};
++						});
++					},
++				],
++			});
++			try {
++				submit(test.terminal, "/focus");
++				submit(test.terminal, "!!intercept this");
++				await started.promise;
++				submit(test.terminal, "/name during interception");
++				expect(await screen(test.terminal)).toContain("Session name set: during interception");
++				submit(test.terminal, "!must not overlap interception");
++				expect(await screen(test.terminal)).toContain("A bash command is already running");
++				expect(interceptions).toBe(1);
++				test.terminal.sendInput("\x15");
++				test.terminal.sendInput("\x1b[200~unsubmitted draft\x1b[201~");
++				test.terminal.sendInput("\x1b[17~");
++				test.terminal.sendInput("\x1b[17~");
++				let output = await screen(test.terminal);
++				for (const text of [
++					"unsubmitted draft",
++					"extension header preserved",
++					"extension widget preserved",
++					"extension status preserved",
++				])
++					expect(output).toContain(text);
++				release.resolve();
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("intercepted shell result"));
++				output = await screen(test.terminal);
++				expect(output).toContain(cancelled ? "(cancelled)" : "(exit 7)");
++				expect(output).toContain("unsubmitted draft");
++				expect(test.harness.session.messages).toHaveLength(1);
++				expect(test.harness.session.messages[0]).toMatchObject({ role: "bashExecution", excludeFromContext: true });
++				expect(test.harness.faux.state.callCount).toBe(0);
++				expect(test.harness.session.pendingMessageCount).toBe(0);
++			} finally {
++				release.resolve();
++				test.cleanup();
++			}
++		},
++	);
++	it.each(["complete", "cancel", "fail"] as const)(
++		"keeps streaming manual bash visible across toggles through %s",
++		async (ending) => {
++			const started = deferred();
++			const release = deferred();
++			let executions = 0;
++			const test = await setup({
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", () => ({
++							operations: {
++								exec: async (_command, _cwd, { onData, signal }) => {
++									executions++;
++									onData(Buffer.from("live manual chunk\n"));
++									signal?.addEventListener("abort", release.resolve, { once: true });
++									started.resolve();
++									await release.promise;
++									signal?.removeEventListener("abort", release.resolve);
++									if (ending === "fail") throw new Error("manual execution failure");
++									if (!signal?.aborted) onData(Buffer.from("last manual chunk\n"));
++									return { exitCode: signal?.aborted ? 130 : 0 };
++								},
++							},
++						}));
++					},
++				],
++			});
++			try {
++				submit(test.terminal, "/focus");
++				submit(test.terminal, "!controlled shell");
++				await started.promise;
++				expect(await screen(test.terminal)).toContain("live manual chunk");
++				submit(test.terminal, "/focus");
++				expect(await screen(test.terminal)).toContain("live manual chunk");
++				submit(test.terminal, "/focus");
++				expect(await screen(test.terminal)).toContain("live manual chunk");
++				expect(test.harness.session.isBashRunning).toBe(true);
++				submit(test.terminal, "!!must not execute");
++				expect(await screen(test.terminal)).toContain("A bash command is already running");
++				expect(executions).toBe(1);
++				test.terminal.sendInput("\x15");
++				if (ending === "cancel") test.terminal.sendInput("\x1b");
++				else release.resolve();
++				await vi.waitFor(() => expect(test.harness.session.isBashRunning).toBe(false));
++				const expected =
++					ending === "complete"
++						? "last manual chunk"
++						: ending === "cancel"
++							? "(cancelled)"
++							: "Bash command failed: manual execution failure";
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain(expected));
++				submit(test.terminal, "/focus");
++				expect(await screen(test.terminal)).toContain(expected);
++				expect(test.harness.faux.state.callCount).toBe(0);
++				expect(test.harness.session.pendingMessageCount).toBe(0);
++			} finally {
++				release.resolve();
++				await test.harness.session.waitForIdle();
++				test.cleanup();
++			}
++		},
++	);
++	it.each([
++		["/name", "Usage: /name <name>"],
++		["/copy", "No agent messages to copy yet."],
++		["/import", "Usage: /import <path.jsonl>"],
++		["/thinking invalid-level", "Unknown thinking level"],
++	])(
++		"preserves explicit %s validation output, but not subsequent unsolicited diagnostics",
++		async (command, expected) => {
++			const test = await setup();
++			try {
++				submit(test.terminal, "/focus");
++				submit(test.terminal, command);
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain(expected));
++				test.mode.showError("background error after command");
++				expect(await screen(test.terminal)).not.toContain("background error after command");
++				submit(test.terminal, "/focus");
++				const output = await screen(test.terminal);
++				expect(output).toContain(expected);
++				expect(output).toContain("background error after command");
++				expect(test.harness.faux.state.callCount).toBe(0);
++				expect(test.harness.session.messages).toEqual([]);
++			} finally {
++				test.cleanup();
++			}
++		},
++	);
++	it.each([
++		["!", true],
++		["!!", true],
++		["!", false],
++		["!!", false],
++	] as const)(
++		"shows normal %s bash results (startedFocused=%s) through toggles without changing context inclusion",
++		async (prefix, startedFocused) => {
++			const test = await setup();
++			try {
++				if (startedFocused) submit(test.terminal, "/focus");
++				submit(test.terminal, `${prefix}printf 'manual result\\n'`);
++				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("manual result"));
++				await vi.waitFor(() => expect(test.harness.session.isBashRunning).toBe(false));
++				const message = test.harness.session.messages.find((message) => message.role === "bashExecution");
++				expect(message).toMatchObject({
++					output: "manual result\n",
++					excludeFromContext: prefix === "!!",
++					exitCode: 0,
++				});
++				const records = structuredClone(test.harness.sessionManager.getEntries());
++				submit(test.terminal, "/focus");
++				expect(await screen(test.terminal)).toContain("manual result");
++				submit(test.terminal, "/focus");
++				expect(
++					(await screen(test.terminal)).split("\n").filter((line) => line.trim() === "manual result"),
++				).toHaveLength(1);
++				expect(test.harness.sessionManager.getEntries()).toEqual(records);
++				expect(test.harness.faux.state.callCount).toBe(0);
++				test.harness.setResponses([
++					(context) => {
++						const modelInput = JSON.stringify(context.messages);
++						if (prefix === "!") expect(modelInput).toContain("manual result");
++						else expect(modelInput).not.toContain("manual result");
++						return fauxAssistantMessage("after manual answer");
++					},
++				]);
++				await test.harness.session.prompt("continue after manual bash");
++				expect(test.harness.faux.state.callCount).toBe(1);
++			} finally {
++				test.cleanup();
++			}
++		},
++	);
++	it.each([
++		["/hotkeys", "Keyboard Shortcuts", "Move cursor / browse history"],
++		["/changelog", "What's New", "Added"],
++	])("keeps the native %s document scrollable in both views", async (command, title, body) => {
++		const test = await setup();
++		try {
++			submit(test.terminal, "/focus");
++			submit(test.terminal, command);
++			await screen(test.terminal);
++			test.terminal.sendInput("\x1b[H"); // Native fullscreen Home, not a separate command viewer.
++			let output = await screen(test.terminal);
++			expect(output).toContain(title);
++			expect(output).toContain(body);
++			submit(test.terminal, "/focus");
++			await screen(test.terminal);
++			test.terminal.sendInput("\x1b[H");
++			output = await screen(test.terminal);
++			expect(output).toContain(title);
++			expect(output).toContain(body);
++			expect(test.harness.faux.state.callCount).toBe(0);
++			expect(test.harness.session.messages).toEqual([]);
++		} finally {
++			test.cleanup();
++		}
++	});
++	it("keeps native name and session output inline in both views without exposing background output", async () => {
++		const test = await setup();
++		try {
++			test.mode.showWarning("unsolicited diagnostic");
++			submit(test.terminal, "/focus");
++			submit(test.terminal, "/name deliberate name");
++			let output = await screen(test.terminal);
++			expect(output).toContain("Session name set: deliberate name");
++			submit(test.terminal, "/session");
++			output = await screen(test.terminal);
++			expect(output).toContain("Session Info");
++			expect(output).toContain("Session name set: deliberate name");
++			expect(output.indexOf("Session name set:")).toBeLessThan(output.indexOf("Session Info"));
++			expect(output).not.toContain("unsolicited diagnostic");
++			submit(test.terminal, "/focus");
++			output = await screen(test.terminal);
++			for (const text of ["Session Info", "Session name set: deliberate name", "unsolicited diagnostic"])
++				expect(output).toContain(text);
++			submit(test.terminal, "/focus");
++			expect((await screen(test.terminal)).match(/Session Info/g)).toHaveLength(1);
++			expect(test.harness.faux.state.callCount).toBe(0);
++			expect(test.harness.session.messages).toEqual([]);
++			expect(test.harness.session.pendingMessageCount).toBe(0);
++		} finally {
++			test.cleanup();
++		}
++	});
++});
+diff --git a/packages/coding-agent/test/interactive-mode-import-command.test.ts b/packages/coding-agent/test/interactive-mode-import-command.test.ts
+index cec7a5def..0f6a92f25 100644
+--- a/packages/coding-agent/test/interactive-mode-import-command.test.ts
++++ b/packages/coding-agent/test/interactive-mode-import-command.test.ts
+@@ -79,7 +79,7 @@ describe("InteractiveMode /import parsing", () => {
+ 		);
+ 		expect(importFromJsonl).toHaveBeenCalledWith("path/to/session.jsonl");
+ 		expect(showError).not.toHaveBeenCalled();
+-		expect(showStatus).toHaveBeenCalledWith("Session imported from: path/to/session.jsonl");
++		expect(showStatus).toHaveBeenCalledWith("Session imported from: path/to/session.jsonl", "explicit");
+ 	});
+ 
+ 	it("passes unquoted apostrophe path to runtimeHost.importFromJsonl unchanged", async () => {
+@@ -107,7 +107,7 @@ describe("InteractiveMode /import parsing", () => {
+ 
+ 		expect(importFromJsonl).toHaveBeenCalledWith("john's/session.jsonl");
+ 		expect(showError).not.toHaveBeenCalled();
+-		expect(showStatus).toHaveBeenCalledWith("Session imported from: john's/session.jsonl");
++		expect(showStatus).toHaveBeenCalledWith("Session imported from: john's/session.jsonl", "explicit");
+ 	});
+ 
+ 	it("shows a non-fatal error when /import path does not exist", async () => {
+@@ -136,7 +136,10 @@ describe("InteractiveMode /import parsing", () => {
+ 
+ 		await interactiveModePrototype.handleImportCommand.call(context, "/import /tmp/missing-session.jsonl");
+ 
+-		expect(showError).toHaveBeenCalledWith("Failed to import session: File not found: /tmp/missing-session.jsonl");
++		expect(showError).toHaveBeenCalledWith(
++			"Failed to import session: File not found: /tmp/missing-session.jsonl",
++			"explicit",
++		);
+ 		expect(showStatus).not.toHaveBeenCalled();
+ 		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
+ 	});
+diff --git a/packages/coding-agent/test/interactive-mode-startup-input.test.ts b/packages/coding-agent/test/interactive-mode-startup-input.test.ts
+index 28a0f48b8..6e025821a 100644
+--- a/packages/coding-agent/test/interactive-mode-startup-input.test.ts
++++ b/packages/coding-agent/test/interactive-mode-startup-input.test.ts
+@@ -14,6 +14,7 @@ type SubmitContext = {
+ 		prompt: (text: string, options?: unknown) => Promise<void>;
+ 	};
+ 	flushPendingBashComponents: () => void;
++	handleFocusCommand: (text: string) => boolean;
+ 	onInputCallback?: (text: string) => void;
+ 	pendingUserInputs: string[];
+ };
+@@ -31,6 +32,7 @@ type StartupSubmitContext = {
+ type InteractiveModePrivate = {
+ 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
+ 	setupEditorSubmitHandler(this: SubmitContext): void;
++	handleFocusCommand(this: SubmitContext, text: string): boolean;
+ 	getUserInput(this: InputContext): Promise<string>;
+ };
+ 
+@@ -50,6 +52,7 @@ function createSubmitContext(): SubmitContext {
+ 			prompt: vi.fn(async () => {}),
+ 		},
+ 		flushPendingBashComponents: vi.fn(),
++		handleFocusCommand: interactiveModePrototype.handleFocusCommand,
+ 		pendingUserInputs: [],
+ 	};
+ }
+@@ -64,7 +67,7 @@ describe("InteractiveMode startup input", () => {
+ 		interactiveModePrototype.handleStartupSubmit.call(context, "early prompt");
+ 
+ 		expect(context.editor.setText).toHaveBeenCalledWith("early prompt");
+-		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress");
++		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress", "explicit");
+ 	});
+ 
+ 	it("queues a normal prompt submitted before the input callback is installed", async () => {
+diff --git a/packages/coding-agent/test/interactive-mode-status.test.ts b/packages/coding-agent/test/interactive-mode-status.test.ts
+index 103b23d33..8a54d6fa9 100644
+--- a/packages/coding-agent/test/interactive-mode-status.test.ts
++++ b/packages/coding-agent/test/interactive-mode-status.test.ts
+@@ -10,7 +10,8 @@ import type { QuietStartup } from "../src/core/settings-manager.ts";
+ import type { SourceInfo } from "../src/core/source-info.ts";
+ import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
+ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
+ 
+ function renderLastLine(container: Container, width = 120): string {
+ 	const last = container.children[container.children.length - 1];
+@@ -79,8 +80,18 @@ describe("InteractiveMode.showStatus", () => {
+ 	});
+ 
+ 	test("coalesces immediately-sequential status messages", () => {
+-		const fakeThis: any = {
+-			chatContainer: new Container(),
++		const chatContainer = new Container();
++		const fakeThis = {
++			chatContainer,
++			transcriptPresentation: new TranscriptPresentation({
++				header: new Container(),
++				resources: new Container(),
++				transcript: chatContainer,
++				pendingOutput: new Container(),
++				getMarkdownTheme,
++				getOutputPad: () => 1,
++				getMarkdownTransformers: () => [],
++			}),
+ 			ui: { requestRender: vi.fn() },
+ 			lastStatusSpacer: undefined,
+ 			lastStatusText: undefined,
+@@ -98,8 +109,18 @@ describe("InteractiveMode.showStatus", () => {
+ 	});
+ 
+ 	test("appends a new status line if something else was added in between", () => {
+-		const fakeThis: any = {
+-			chatContainer: new Container(),
++		const chatContainer = new Container();
++		const fakeThis = {
++			chatContainer,
++			transcriptPresentation: new TranscriptPresentation({
++				header: new Container(),
++				resources: new Container(),
++				transcript: chatContainer,
++				pendingOutput: new Container(),
++				getMarkdownTheme,
++				getOutputPad: () => 1,
++				getMarkdownTransformers: () => [],
++			}),
+ 			ui: { requestRender: vi.fn() },
+ 			lastStatusSpacer: undefined,
+ 			lastStatusText: undefined,
+@@ -164,7 +185,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
+ 		expect(header.setExpanded).toHaveBeenCalledWith(true);
+ 		expect(loadedResourcesChild.setExpanded).toHaveBeenCalledWith(true);
+ 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
+-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded");
++		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded", "background");
+ 	});
+ });
+ 
+diff --git a/packages/coding-agent/test/interactive-mode-suspend.test.ts b/packages/coding-agent/test/interactive-mode-suspend.test.ts
+index 996d2f1ab..ded301696 100644
+--- a/packages/coding-agent/test/interactive-mode-suspend.test.ts
++++ b/packages/coding-agent/test/interactive-mode-suspend.test.ts
+@@ -54,7 +54,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
+ 			}
+ 		}
+ 
+-		expect(showStatus).toHaveBeenCalledWith("Suspend to background is not supported on Windows");
++		expect(showStatus).toHaveBeenCalledWith("Suspend to background is not supported on Windows", "explicit");
+ 		expect(ui.stop).not.toHaveBeenCalled();
+ 		expect(setIntervalSpy).not.toHaveBeenCalled();
+ 		expect(processOnSpy).not.toHaveBeenCalledWith("SIGINT", expect.any(Function));
+diff --git a/packages/coding-agent/test/interactive-mode-tree-navigation.test.ts b/packages/coding-agent/test/interactive-mode-tree-navigation.test.ts
+index 9b87993dd..6c74b8038 100644
+--- a/packages/coding-agent/test/interactive-mode-tree-navigation.test.ts
++++ b/packages/coding-agent/test/interactive-mode-tree-navigation.test.ts
+@@ -81,7 +81,7 @@ describe("InteractiveMode tree navigation availability", () => {
+ 
+ 		await select();
+ 
+-		expect(ui.showError).toHaveBeenCalledWith(busyMessage);
++		expect(ui.showError).toHaveBeenCalledWith(busyMessage, "explicit");
+ 		expect(ui.showStatusIndicator).not.toHaveBeenCalled();
+ 		expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
+ 		expect(ui.defaultEditor.onEscape).toBe(onEscape);
+@@ -135,7 +135,7 @@ describe("InteractiveMode tree navigation availability", () => {
+ 		await select();
+ 
+ 		expect(ui.session.abort).toHaveBeenCalledOnce();
+-		expect(ui.showError).toHaveBeenCalledWith(busyMessage);
++		expect(ui.showError).toHaveBeenCalledWith(busyMessage, "explicit");
+ 		expect(ui.showStatusIndicator).not.toHaveBeenCalled();
+ 		expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
+ 		expect(ui.defaultEditor.onEscape).toBe(onEscape);
+diff --git a/packages/coding-agent/test/interactive-tui.test.ts b/packages/coding-agent/test/interactive-tui.test.ts
+index 559edfe36..521ea1713 100644
+--- a/packages/coding-agent/test/interactive-tui.test.ts
++++ b/packages/coding-agent/test/interactive-tui.test.ts
+@@ -358,7 +358,7 @@ describe("InteractiveMode copy confirmation", () => {
+ 
+ 		await copyCommandPrototype.handleCopyCommand.call(context, { flashConfirmation: true, preferSelection: true });
+ 
+-		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard");
++		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard", "explicit");
+ 		expect(showError).not.toHaveBeenCalled();
+ 	});
+ });
+diff --git a/packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts b/packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts
+index 8d1c2dab0..3b346e775 100644
+--- a/packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts
++++ b/packages/coding-agent/test/suite/regressions/4167-thinking-toggle-pending-tool-render.test.ts
+@@ -4,6 +4,7 @@ import { Container, Text, type TUI } from "@earendil-works/pi-tui";
+ import { beforeAll, describe, expect, test, vi } from "vitest";
+ import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
+ import type { SessionEntry } from "../../../src/core/session-manager.ts";
++import type { BashExecutionComponent } from "../../../src/modes/interactive/components/bash-execution.ts";
+ import type { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.ts";
+ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+ import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
+@@ -35,6 +36,8 @@ type RenderSessionItems = (
+ 
+ type RenderSessionContextThis = {
+ 	pendingTools: Map<string, ToolExecutionComponent>;
++	pendingBashComponents: Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">;
++	pendingMessagesContainer: Container;
+ 	chatContainer: Container;
+ 	footer: { invalidate(): void };
+ 	ui: TUI;
+@@ -66,6 +69,8 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
+ 	const chatContainer = new Container();
+ 	return {
+ 		pendingTools: new Map<string, ToolExecutionComponent>(),
++		pendingBashComponents: new Map(),
++		pendingMessagesContainer: new Container(),
+ 		chatContainer,
+ 		footer: { invalidate: vi.fn() },
+ 		ui: { requestRender: vi.fn() } as unknown as TUI,
+diff --git a/packages/coding-agent/test/suite/regressions/7027-credential-refresh-hang.test.ts b/packages/coding-agent/test/suite/regressions/7027-credential-refresh-hang.test.ts
+index 1bfef098e..b6157969a 100644
+--- a/packages/coding-agent/test/suite/regressions/7027-credential-refresh-hang.test.ts
++++ b/packages/coding-agent/test/suite/regressions/7027-credential-refresh-hang.test.ts
+@@ -121,6 +121,7 @@ describe("issues #7027 and #7113 credential refresh hang", () => {
+ 		await vi.advanceTimersByTimeAsync(15_000);
+ 		expect(showWarning).toHaveBeenCalledWith(
+ 			"Saved API key for Stalled Login, but its model catalog refresh timed out; using cached models.",
++			"explicit",
+ 		);
+ 	});
+ });
+@@ -165,7 +166,7 @@ describe("post-login model discovery", () => {
+ 			ui: { requestRender: vi.fn() },
+ 		};
+ 		await complete.call(context, "radius", "Radius", "oauth", unknownModel);
+-		expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("Credentials saved"));
++		expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("Credentials saved"), "explicit");
+ 		expect(context.showError).not.toHaveBeenCalled();
+ 		expect(setModel).not.toHaveBeenCalled();
+ 
+@@ -198,7 +199,7 @@ describe("post-login model discovery", () => {
+ 		const login = await startLogin();
+ 		await login.discover([]);
+ 		expect(login.setModel).not.toHaveBeenCalled();
+-		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"));
++		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"), "explicit");
+ 	});
+ 
+ 	it("preserves a model selected during refresh", async () => {
+@@ -212,8 +213,8 @@ describe("post-login model discovery", () => {
+ 	it("bounds refresh to 15 seconds", async () => {
+ 		const login = await startLogin();
+ 		await vi.advanceTimersByTimeAsync(15_000);
+-		expect(login.showWarning).toHaveBeenCalledWith(expect.stringContaining("timed out"));
+-		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"));
++		expect(login.showWarning).toHaveBeenCalledWith(expect.stringContaining("timed out"), "explicit");
++		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"), "explicit");
+ 		expect(login.setModel).not.toHaveBeenCalled();
+ 	});
+ });
+diff --git a/packages/coding-agent/test/suite/regressions/7443-model-command-cached-match.test.ts b/packages/coding-agent/test/suite/regressions/7443-model-command-cached-match.test.ts
+index 288bb8264..b698369f5 100644
+--- a/packages/coding-agent/test/suite/regressions/7443-model-command-cached-match.test.ts
++++ b/packages/coding-agent/test/suite/regressions/7443-model-command-cached-match.test.ts
+@@ -41,6 +41,6 @@ describe("issue #7443 /model cached match", () => {
+ 
+ 		expect(refresh).toHaveBeenCalledOnce();
+ 		expect(refresh.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
+-		expect(context.showStatus).toHaveBeenCalledWith("Refreshing model catalogs…");
++		expect(context.showStatus).toHaveBeenCalledWith("Refreshing model catalogs…", "explicit");
+ 	});
+ });
+diff --git a/packages/coding-agent/test/suite/regressions/7829-invalid-settings-warning.test.ts b/packages/coding-agent/test/suite/regressions/7829-invalid-settings-warning.test.ts
+index cb73e3602..0ac1d44bd 100644
+--- a/packages/coding-agent/test/suite/regressions/7829-invalid-settings-warning.test.ts
++++ b/packages/coding-agent/test/suite/regressions/7829-invalid-settings-warning.test.ts
+@@ -2,7 +2,8 @@ import { Container } from "@earendil-works/pi-tui";
+ import { beforeAll, describe, expect, it, vi } from "vitest";
+ import type { AgentSessionRuntimeDiagnostic } from "../../../src/core/agent-session-services.ts";
+ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+-import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
++import { getMarkdownTheme, initTheme } from "../../../src/modes/interactive/theme/theme.ts";
++import { TranscriptPresentation } from "../../../src/modes/interactive/transcript-presentation.ts";
+ import { createHarness } from "../harness.ts";
+ 
+ function render(container: Container): string {
+@@ -28,6 +29,15 @@ describe("issue #7829 invalid settings warning", () => {
+ 				init: vi.fn(async () => {}),
+ 				options: { startupDiagnostics },
+ 				chatContainer,
++				transcriptPresentation: new TranscriptPresentation({
++					header: new Container(),
++					resources: new Container(),
++					transcript: chatContainer,
++					pendingOutput: new Container(),
++					getMarkdownTheme,
++					getOutputPad: () => 1,
++					getMarkdownTransformers: () => [],
++				}),
+ 				outputPad: 1,
+ 				ui: { requestRender: vi.fn() },
+ 				version: "test",
+diff --git a/packages/coding-agent/test/suite/regressions/9068-user-bash-fail-closed.test.ts b/packages/coding-agent/test/suite/regressions/9068-user-bash-fail-closed.test.ts
+index 58c0ec18b..2bc719273 100644
+--- a/packages/coding-agent/test/suite/regressions/9068-user-bash-fail-closed.test.ts
++++ b/packages/coding-agent/test/suite/regressions/9068-user-bash-fail-closed.test.ts
+@@ -1,6 +1,7 @@
+ import { afterEach, describe, expect, test, vi } from "vitest";
+ import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
+ import type { ExtensionAPI, UserBashEvent, UserBashEventResult } from "../../../src/core/extensions/types.ts";
++import type { BashExecutionComponent } from "../../../src/modes/interactive/components/bash-execution.ts";
+ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+ import { runRpcMode } from "../../../src/modes/rpc/rpc-mode.ts";
+ import { createHarness, type Harness } from "../harness.ts";
+@@ -122,16 +123,23 @@ type InteractiveBashContext = {
+ 	ui: { requestRender(): void };
+ 	chatContainer: { addChild(component: unknown): void };
+ 	pendingMessagesContainer: { addChild(component: unknown): void };
+-	pendingBashComponents: unknown[];
++	pendingBashComponents: Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">;
+ 	isBashMode: boolean;
+-	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
++	handleBashCommand(command: string, excludeFromContext: boolean, reservation: symbol): Promise<void>;
++	handleFocusCommand(text: string): boolean;
+ 	showError(message: string): void;
+ 	updateEditorBorderColor(): void;
+ };
+ 
+ const interactiveModePrototype = InteractiveMode.prototype as unknown as {
+ 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
+-	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
++	handleBashCommand(
++		this: InteractiveBashContext,
++		command: string,
++		excludeFromContext: boolean,
++		reservation: symbol,
++	): Promise<void>;
++	handleFocusCommand(this: InteractiveBashContext, text: string): boolean;
+ };
+ 
+ const localResult = {
+@@ -244,9 +252,10 @@ describe("Interactive user_bash failure handling (#9068)", () => {
+ 			ui: { requestRender: vi.fn() },
+ 			chatContainer: { addChild: vi.fn() },
+ 			pendingMessagesContainer: { addChild: vi.fn() },
+-			pendingBashComponents: [],
++			pendingBashComponents: new Map(),
+ 			isBashMode: true,
+ 			handleBashCommand: interactiveModePrototype.handleBashCommand,
++			handleFocusCommand: interactiveModePrototype.handleFocusCommand,
+ 			showError: vi.fn(),
+ 			updateEditorBorderColor: vi.fn(),
+ 		};
+diff --git a/packages/coding-agent/test/transcript-presentation.test.ts b/packages/coding-agent/test/transcript-presentation.test.ts
+index 1ed9e1865..691b275ff 100644
+--- a/packages/coding-agent/test/transcript-presentation.test.ts
++++ b/packages/coding-agent/test/transcript-presentation.test.ts
+@@ -48,7 +48,7 @@ describe("transcript presentation", () => {
+ 		const presentation = new TranscriptPresentation({
+ 			header: new Text("header", 0, 0),
+ 			resources: new Text("resources", 0, 0),
+-			transcript: new Text("ordinary", 0, 0),
++			transcript: pendingOutput("ordinary"),
+ 			pendingOutput: pendingOutput("pending"),
+ 			getMarkdownTheme,
+ 			getOutputPad: () => 1,
+@@ -124,7 +124,7 @@ describe("transcript presentation", () => {
+ 		const presentation = new TranscriptPresentation({
+ 			header: new Text("header", 0, 0),
+ 			resources: new Text("resources", 0, 0),
+-			transcript: new Text("ordinary", 0, 0),
++			transcript: pendingOutput("ordinary"),
+ 			pendingOutput: pendingOutput("pending"),
+ 			getMarkdownTheme,
+ 			getOutputPad: () => 1,
+@@ -155,10 +155,12 @@ describe("transcript presentation", () => {
+ 		let padding = 1;
+ 		let label = "old rendering";
+ 		const ordinary = new Text("ordinary initial", 0, 0);
++		const transcript = new Container();
++		transcript.addChild(ordinary);
+ 		const presentation = new TranscriptPresentation({
+ 			header: new Text("header", 0, 0),
+ 			resources: new Text("resources", 0, 0),
+-			transcript: ordinary,
++			transcript,
+ 			pendingOutput: pendingOutput("pending"),
+ 			getMarkdownTheme,
+ 			getOutputPad: () => padding,
+@@ -193,7 +195,7 @@ describe("transcript presentation", () => {
+ 		const presentation = new TranscriptPresentation({
+ 			header: new Text("header", 0, 0),
+ 			resources: new Text("resources", 0, 0),
+-			transcript: new Text("ordinary", 0, 0),
++			transcript: pendingOutput("ordinary"),
+ 			pendingOutput: pendingOutput("pending"),
+ 			getMarkdownTheme,
+ 			getOutputPad: () => 1,
+-- 
+2.47.3
+
