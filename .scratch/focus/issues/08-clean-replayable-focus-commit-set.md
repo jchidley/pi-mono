@@ -4,7 +4,7 @@
 
 **Status:** ready-for-agent
 
-**Current state and plan:** [Focus current state](../upgrade-review.md). Clean baseline `400f5b939456f59e872b4c89cd78bce3209d19d8` on `focus/clean-v1.0.0` is complete; [baseline mail patch](../upgrade-bundle/README.md) is retained. Parent checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec` rebases the original eight commits onto upstream ancestor `83692682f`; restored fixes are committed in `f843f652174ccd2fcf9b0d4acb81775872c5f291` on `stock/pi-1.0.0`. Local consolidation commits are complete, with Focus records and cancelled selection-copy records committed separately from code. Separate `focus/pi-1.0.1` retains a resolved/staged cherry-pick, not a target commit. Owner declined the unrelated AI-test fix and accepts its known check failure for local commits; no approval question remains for canonical-checkout consolidation.
+**Current state and plan:** [Focus current state](../upgrade-review.md). Clean baseline `400f5b939456f59e872b4c89cd78bce3209d19d8` on `focus/clean-v1.0.0` is complete; [baseline mail patch](../upgrade-bundle/README.md) is retained. Parent checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec` rebases the original eight commits onto upstream ancestor `83692682f`; restored fixes are committed in `f843f652174ccd2fcf9b0d4acb81775872c5f291` on `focus/main` (renamed from `stock/pi-1.0.0`). Local consolidation commits are complete, with Focus records and cancelled selection-copy records committed separately from code. Separate `focus/pi-1.0.1` retains a resolved/staged cherry-pick, not a target commit. Owner declined the unrelated AI-test fix and accepts its known check failure for local commits; no approval question remains for canonical-checkout consolidation.
 
 ## Criteria
 
