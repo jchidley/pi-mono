@@ -2,7 +2,7 @@
 
 ## Position
 
-Canonical checkout: `~/git/pi-mono`, branch `stock/pi-1.0.0`. Eight original commits were rebased onto upstream ancestor `83692682f095528f8b71652ddacff7075e36e893`, reaching `1f915d4921946080e6df12d7aa4ed9a609a59cec`; the subsequent local code commit is `f843f652174ccd2fcf9b0d4acb81775872c5f291`. Local consolidation records are committed separately on this branch. No publication or arbitrary-release compatibility is claimed.
+Canonical checkout: `~/git/pi-mono`, branch `focus/main` (renamed from `stock/pi-1.0.0` after consolidation). Eight original commits were rebased onto upstream ancestor `83692682f095528f8b71652ddacff7075e36e893`, reaching `1f915d4921946080e6df12d7aa4ed9a609a59cec`; the subsequent local code commit is `f843f652174ccd2fcf9b0d4acb81775872c5f291`. Local consolidation records are committed separately on this branch. No publication or arbitrary-release compatibility is claimed.
 
 The clean Focus-only baseline is complete: `focus/clean-v1.0.0` at `400f5b939456f59e872b4c89cd78bce3209d19d8`, based on approved stock `v1.0.0` (`a13d35a74`). It contains 32 source/test paths, including the upgrade fixes and #5943 fixture correction, without local tracker/acceptance docs. Its [mail patch](upgrade-bundle/README.md) is the baseline delivery artifact.
 

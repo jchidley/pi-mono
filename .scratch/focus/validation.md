@@ -1,6 +1,6 @@
 # Focus validation closure
 
-Tickets 01–06 are implemented; original owner acceptance closed at historical HEAD `494c6c0b674535d21bc6c978e88b7bf58f231546`. Current local code anchor on `stock/pi-1.0.0` is `f843f652174ccd2fcf9b0d4acb81775872c5f291`, following rebased HEAD `1f915d4921946080e6df12d7aa4ed9a609a59cec`. Clean baseline packaging and canonical-checkout consolidation are complete; the separate target cherry-pick is still pending. The owner accepts the known unchanged upstream full-check failure for local commits, not a full-check pass. See [current gate](#current-rebased-target-gate) before using the historical passing checks below. The final local commit run repeated the full check and four affected test files as recorded below; no configuration or unrelated AI code changed.
+Tickets 01–06 are implemented; original owner acceptance closed at historical HEAD `494c6c0b674535d21bc6c978e88b7bf58f231546`. Current local code anchor on `focus/main` is `f843f652174ccd2fcf9b0d4acb81775872c5f291`, following rebased HEAD `1f915d4921946080e6df12d7aa4ed9a609a59cec`. Clean baseline packaging and canonical-checkout consolidation are complete; the separate target cherry-pick is still pending. The owner accepts the known unchanged upstream full-check failure for local commits, not a full-check pass. See [current gate](#current-rebased-target-gate) before using the historical passing checks below. The final local commit run repeated the full check and four affected test files as recorded below; no configuration or unrelated AI code changed.
 
 The [original specification](spec.md) remains controlling. Its initial source-review checkpoint is historical, not the current validation result. Ticket checkmarks record criterion completion, not a claim that every variant was manually exercised. The tracker has no completion status: `ready-for-agent` is retained as its existing readiness label, with completion recorded in ticket comments and here; it is not a new work queue.
 
@@ -87,7 +87,7 @@ The superseded consolidated binary snapshot included these then-uncommitted fixe
 
 ## Current rebased target gate
 
-Verified Git anchors: parent `stock/pi-1.0.0` rebased checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec`, exactly eight commits above upstream ancestor `83692682f095528f8b71652ddacff7075e36e893`, followed by local code commit `f843f652174ccd2fcf9b0d4acb81775872c5f291` and separate local records commits; backup `backup/focus-before-main-rebase-20261003-494c6c0b` at original `494c6c0b6`; stash `1d55952d583caf79cd8d79111db95684feacd17b` retained. Upstream README text is preserved with a local signpost section. Portable baseline code/tests and local records remain separate.
+Verified Git anchors: parent `focus/main` (formerly `stock/pi-1.0.0`) rebased checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec`, exactly eight commits above upstream ancestor `83692682f095528f8b71652ddacff7075e36e893`, followed by local code commit `f843f652174ccd2fcf9b0d4acb81775872c5f291` and separate local records commits; backup `backup/focus-before-main-rebase-20261003-494c6c0b` at original `494c6c0b6`; stash `1d55952d583caf79cd8d79111db95684feacd17b` retained. Upstream README text is preserved with a local signpost section. Portable baseline code/tests and local records remain separate.
 
 | Checkpoint | Evidence and result |
 |---|---|

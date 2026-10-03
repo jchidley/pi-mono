@@ -18,7 +18,7 @@ Do not apply this over the already integrated canonical checkout or the retained
 
 ## Current integration gate
 
-Parent `stock/pi-1.0.0` rebased checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec` is the original eight-commit history above upstream ancestor `83692682f`; upgrade fixes and fixture corrections are now committed in `f843f652174ccd2fcf9b0d4acb81775872c5f291`. Local documentation commits are separate. Separate managed branch `focus/pi-1.0.1` at `a7229ddc2` retains a resolved/staged baseline cherry-pick, **not a target commit**. Native Armin animation/explicit fallback and upstream removals/APIs were reconciled on both.
+Parent `focus/main` (formerly `stock/pi-1.0.0`) rebased checkpoint `1f915d4921946080e6df12d7aa4ed9a609a59cec` is the original eight-commit history above upstream ancestor `83692682f`; upgrade fixes and fixture corrections are now committed in `f843f652174ccd2fcf9b0d4acb81775872c5f291`. Local documentation commits are separate. Separate managed branch `focus/pi-1.0.1` at `a7229ddc2` retains a resolved/staged baseline cherry-pick, **not a target commit**. Native Armin animation/explicit fallback and upstream removals/APIs were reconciled on both.
 
 Target tests/native smoke passed, but full check remains blocked by untouched upstream `packages/ai/test/stream.test.ts:705`: `claude-sonnet-4-5` is absent from the pinned catalog. Parent dependency synchronization removed the stale SDK errors without lock drift. Owner declined the unrelated AI-test fix and accepts its known gate failure for the completed local consolidation commits. The full check is not a pass; browser-smoke was not reached. This bundle remains a baseline artifact, not an export of the current rebased source or a guarantee for arbitrary updates.
 
