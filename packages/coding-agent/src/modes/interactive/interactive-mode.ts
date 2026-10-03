@@ -37,6 +37,7 @@ import {
 	fuzzyFilter,
 	getCapabilities,
 	hyperlink,
+	isKeyRelease,
 	Markdown,
 	matchesKey,
 	Spacer,
@@ -896,6 +897,12 @@ export class InteractiveMode {
 
 	private mountInteractiveTui(tui: TuiMainScreen | TuiAltScreen, components: readonly Component[]): void {
 		for (const component of components) tui.addChild(component);
+		// This local action must also work while native transcript search owns keyboard focus.
+		tui.addInputListener((data) => {
+			if (!this.isInitialized || !this.keybindings.matches(data, "app.transcript.toggleFinalOnly")) return;
+			if (!isKeyRelease(data)) this.toggleFocus();
+			return { consume: true };
+		});
 		if (TuiLayouts.isViewportTUI(tui)) {
 			if (!this.fullscreenLayoutRoot) throw new Error("Fullscreen layout is not initialized");
 			tui.setLayoutRoot(this.fullscreenLayoutRoot);
@@ -915,6 +922,7 @@ export class InteractiveMode {
 		const previousUi = this.renderer;
 		if (mode === previousUi.mode) return true;
 		if (previousUi.hasOverlayEntries) return false;
+		if (mode === "regular") this.transcriptPresentation.disableFocus();
 
 		const components = [...previousUi.children];
 		const focus = previousUi.getFocusedComponent();
@@ -3125,7 +3133,6 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
-		this.defaultEditor.onAction("app.transcript.toggleFinalOnly", () => this.toggleFocus());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction(
 			"app.message.copy",
@@ -4651,7 +4658,9 @@ export class InteractiveMode {
 			this.showStatus("Focus requires fullscreen mode. Enable it in /settings.");
 			return;
 		}
+		if (this.renderer instanceof TuiAltScreen) this.renderer.resetDocumentInteractions();
 		this.transcriptPresentation.toggleFocus();
+		// Each replacement starts at the bottom; native follow-end handles growth and relayout.
 		this.transcriptScrollView?.scrollToEnd();
 		this.ui.invalidate();
 		this.ui.requestRender();
