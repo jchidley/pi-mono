@@ -919,13 +919,13 @@ describe("explicit native output in focus", () => {
 			submit(test.terminal, "/focus");
 			submit(test.terminal, command);
 			await screen(test.terminal);
-			test.terminal.sendInput("\x1b[H"); // Native fullscreen Home, not a separate command viewer.
+			test.terminal.sendInput("\x1b[1;5H"); // Native fullscreen Ctrl+Home, not a separate command viewer.
 			let output = await screen(test.terminal);
 			expect(output).toContain(title);
 			expect(output).toContain(body);
 			submit(test.terminal, "/focus");
 			await screen(test.terminal);
-			test.terminal.sendInput("\x1b[H");
+			test.terminal.sendInput("\x1b[1;5H");
 			output = await screen(test.terminal);
 			expect(output).toContain(title);
 			expect(output).toContain(body);

@@ -135,14 +135,14 @@ describe("native fullscreen focus interactions", () => {
 			await test.harness.session.prompt("first scroll user");
 			test.mode.showWarning("ordinary bottom diagnostic");
 			expect(await screen(test.terminal)).toContain("first bottom answer");
-			test.terminal.sendInput("\x1bOH");
+			test.terminal.sendInput("\x1b[1;5H");
 			expect(await screen(test.terminal)).not.toContain("first bottom answer");
 			submit(test.terminal, "/focus");
 			expect(await screen(test.terminal)).toContain("first bottom answer");
 			test.harness.setResponses([fauxAssistantMessage("growing bottom answer")]);
 			await test.harness.session.prompt("growing user");
 			expect(await screen(test.terminal)).toContain("growing bottom answer");
-			test.terminal.sendInput("\x1bOH");
+			test.terminal.sendInput("\x1b[1;5H");
 			expect(await screen(test.terminal)).not.toContain("growing bottom answer");
 			test.harness.setResponses([fauxAssistantMessage("hidden latest answer")]);
 			await test.harness.session.prompt("hidden latest user");
@@ -152,7 +152,7 @@ describe("native fullscreen focus interactions", () => {
 			submit(test.terminal, "/focus");
 			let output = await screen(test.terminal);
 			expect(output).toContain("hidden latest answer");
-			test.terminal.sendInput("\x1bOH");
+			test.terminal.sendInput("\x1b[1;5H");
 			await screen(test.terminal);
 			test.terminal.resize(90, 28);
 			submit(test.terminal, "/focus");
