@@ -12,4 +12,4 @@ After a successful rebase, run `npm run hydrate:model-data`, then `npm run check
 (cd packages/tui && node --test test/tui-document-interactions.test.ts)
 ```
 
-Stop and report any failed validation without expanding scope. Report the selected release, backup branch, validation results, and working-tree status. Do not push, install Pi globally, run a build, or commit changes.
+Stop and report any failed validation without expanding scope. Report the selected release, backup branch, validation results, and working-tree status. After validation passes, report the script's versioned push command as an optional next step; do not execute it. Do not push, install Pi globally, run a build, or commit changes.

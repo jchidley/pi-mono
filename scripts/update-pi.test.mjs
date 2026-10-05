@@ -63,11 +63,14 @@ test("rebases custom commits onto highest stable upstream tag, not main or a loc
 	const result = f.run();
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /Updated focus\/main to v1\.0\.10/);
+	assert.match(result.stdout, /git push origin focus\/main:focus\/pi-1\.0\.10/);
 	assert.equal(f.git(f.local, "rev-parse", "HEAD~1"), f.git(f.upstream, "rev-parse", "v1.0.10"));
 	const backup = f.git(f.local, "for-each-ref", "--format=%(objectname)", "refs/heads/backup/");
 	assert.equal(backup, oldTip);
 	assert.equal(f.git(f.local, "status", "--porcelain"), "");
-	assert.match(f.run().stdout, /no rebase needed/);
+	const unchanged = f.run();
+	assert.match(unchanged.stdout, /no rebase needed/);
+	assert.doesNotMatch(unchanged.stdout, /git push/);
 });
 
 test("accepts annotated release tags and does nothing when already current", (t) => {
@@ -98,6 +101,7 @@ test("leaves conflicts for the owner and refuses another update until resolved",
 	const result = f.run();
 	assert.notEqual(result.status, 0);
 	assert.match(result.stderr, /git rebase --continue/);
+	assert.doesNotMatch(result.stdout, /git push/);
 	assert.equal(f.git(f.local, "for-each-ref", "--format=%(objectname)", "refs/heads/backup/"), oldTip);
 	assert.match(f.run().stderr, /existing Git operation/);
 	f.git(f.local, "rebase", "--abort");
