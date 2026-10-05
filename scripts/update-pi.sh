@@ -46,3 +46,4 @@ if ! git -c rebase.autoStash=false rebase "refs/tags/$tag"; then
 	exit 1
 fi
 printf 'Updated focus/main to %s. Run repository checks and focused tests before using it.\n' "$tag"
+printf 'After validation, publish explicitly without force-pushing:\n  git push origin focus/main:focus/pi-%s\n' "${tag#v}"
