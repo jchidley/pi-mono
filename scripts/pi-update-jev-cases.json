@@ -1,0 +1,37 @@
+[
+  {
+    "claim": "The update was rebased onto v1.0.4 and published to my fork.",
+    "evidence": "Successfully rebased and updated refs/heads/focus/main. Updated focus/main to v1.0.4. Push output: [new branch] focus/main -> focus/pi-1.0.4.",
+    "expected": "supported"
+  },
+  {
+    "claim": "All validation passed.",
+    "evidence": "Hydration and npm run check completed successfully. The TUI test passed. The coding-agent regression tests have not been run.",
+    "expected": "contradicted"
+  },
+  {
+    "claim": "The coding-agent regression tests passed.",
+    "evidence": "Hydration and npm run check completed successfully. The TUI test passed. No coding-agent test result was provided.",
+    "expected": "insufficient"
+  },
+  {
+    "claim": "Pi is now installed globally at v1.0.4.",
+    "evidence": "Push output: [new branch] focus/main -> focus/pi-1.0.4.",
+    "expected": "insufficient"
+  },
+  {
+    "claim": "It is safe to publish because all required checks passed.",
+    "evidence": "Repository check exited 1 with a TypeScript error. The TUI test passed.",
+    "expected": "contradicted"
+  },
+  {
+    "claim": "The required validation passed, but this does not establish that Pi was installed or that every possible bug is absent.",
+    "evidence": "Model hydration, repository checks, coding-agent regressions and TUI tests all exited 0. HEAD and focus/main were unchanged and the working tree stayed clean.",
+    "expected": "supported"
+  },
+  {
+    "claim": "The upstream forced update means my focus/main branch was force-pushed.",
+    "evidence": "Fetch output: upstream/feat/package-artifact-pipeline (forced update). Publication output: [new branch] focus/main -> focus/pi-1.0.4.",
+    "expected": "contradicted"
+  }
+]
