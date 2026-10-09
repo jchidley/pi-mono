@@ -25,6 +25,7 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { SessionManager } from "../../core/session-manager.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
@@ -43,7 +44,10 @@ export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcNavigateTreeOptions,
+	RpcNavigateTreeResult,
 	RpcResponse,
+	RpcSessionInfo,
 	RpcSessionState,
 } from "./rpc-types.ts";
 
@@ -595,6 +599,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "get_session_stats", stats);
 			}
 
+			case "list_sessions": {
+				const sessionManager = session.sessionManager;
+				const sessions = await SessionManager.list(sessionManager.getCwd(), sessionManager.getSessionDir());
+				return success(id, "list_sessions", {
+					sessions: sessions.map((info) => ({
+						path: info.path,
+						id: info.id,
+						cwd: info.cwd,
+						name: info.name,
+						parentSessionPath: info.parentSessionPath,
+						created: info.created.toISOString(),
+						modified: info.modified.toISOString(),
+						messageCount: info.messageCount,
+						firstMessage: info.firstMessage,
+						allMessagesText: info.allMessagesText,
+					})),
+				});
+			}
+
 			case "export_html": {
 				const path = await session.exportToHtml(command.outputPath);
 				return success(id, "export_html", { path });
@@ -649,6 +672,20 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "get_tree": {
 				const sessionManager = session.sessionManager;
 				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
+			}
+
+			case "navigate_tree": {
+				const result = await session.navigateTree(command.targetId, {
+					summarize: command.summarize,
+					customInstructions: command.customInstructions,
+					replaceInstructions: command.replaceInstructions,
+					label: command.label,
+				});
+				return success(id, "navigate_tree", {
+					cancelled: result.cancelled,
+					...(result.editorText !== undefined ? { editorText: result.editorText } : {}),
+					...(result.aborted !== undefined ? { aborted: result.aborted } : {}),
+				});
 			}
 
 			case "get_last_assistant_text": {

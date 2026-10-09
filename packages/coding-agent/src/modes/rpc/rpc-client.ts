@@ -13,7 +13,15 @@ import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
+import type {
+	RpcCommand,
+	RpcNavigateTreeOptions,
+	RpcNavigateTreeResult,
+	RpcResponse,
+	RpcSessionInfo,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.ts";
 
 // ============================================================================
 // Types
@@ -371,6 +379,14 @@ export class RpcClient {
 	}
 
 	/**
+	 * List sessions for the current project in the configured session directory.
+	 */
+	async listSessions(): Promise<RpcSessionInfo[]> {
+		const response = await this.send({ type: "list_sessions" });
+		return this.getData<{ sessions: RpcSessionInfo[] }>(response).sessions;
+	}
+
+	/**
 	 * Export session to HTML.
 	 */
 	async exportHtml(outputPath?: string): Promise<{ path: string }> {
@@ -427,6 +443,21 @@ export class RpcClient {
 	async getTree(): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
 		const response = await this.send({ type: "get_tree" });
 		return this.getData<{ tree: SessionTreeNode[]; leafId: string | null }>(response);
+	}
+
+	/**
+	 * Navigate within the current session tree.
+	 */
+	async navigateTree(targetId: string, options: RpcNavigateTreeOptions = {}): Promise<RpcNavigateTreeResult> {
+		const response = await this.send({
+			type: "navigate_tree",
+			targetId,
+			summarize: options.summarize,
+			customInstructions: options.customInstructions,
+			replaceInstructions: options.replaceInstructions,
+			label: options.label,
+		});
+		return this.getData(response);
 	}
 
 	/**

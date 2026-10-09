@@ -523,6 +523,41 @@ Response:
 
 ## Session
 
+### list_sessions
+
+List sessions for the current project in the configured session directory. This command takes no path; the RPC process's current session determines both the project and storage directory. Sessions are returned in the same order as `SessionManager.list`.
+
+```json
+{"type": "list_sessions"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "list_sessions",
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "path": "/path/to/session.jsonl",
+        "id": "abc123",
+        "cwd": "/path/to/project",
+        "name": "my-feature-work",
+        "parentSessionPath": "/path/to/parent.jsonl",
+        "created": "2026-01-02T03:04:05.000Z",
+        "modified": "2026-01-02T04:05:06.000Z",
+        "messageCount": 4,
+        "firstMessage": "Initial request",
+        "allMessagesText": "Initial request First response"
+      }
+    ]
+  }
+}
+```
+
+`name` and `parentSessionPath` are optional. `created` and `modified` are ISO 8601 strings.
+
 ### get_session_stats
 
 Get token usage, cost statistics, and current context window usage.
@@ -743,6 +778,33 @@ Response:
   }
 }
 ```
+
+### navigate_tree
+
+Navigate to an entry within the current session's append-only tree. The operation delegates to `AgentSession.navigateTree`; after a non-cancelled result, use `get_messages`, `get_entries`, or `get_tree` for the authoritative updated snapshot.
+
+```json
+{
+  "type": "navigate_tree",
+  "targetId": "abc123",
+  "summarize": false,
+  "customInstructions": "Focus on decisions",
+  "replaceInstructions": false,
+  "label": "alternative"
+}
+```
+
+Only `targetId` is required. Response:
+```json
+{
+  "type": "response",
+  "command": "navigate_tree",
+  "success": true,
+  "data": {"cancelled": false, "editorText": "Original user message"}
+}
+```
+
+`editorText` is present when navigating to a user or custom message that should return to the editor. Extension cancellation is a successful response with `{"cancelled": true}` and leaves the session unchanged. If branch summarization is aborted, `aborted: true` is also returned. Invalid targets produce a correlated `success: false` response.
 
 ### get_last_assistant_text
 
