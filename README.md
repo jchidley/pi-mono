@@ -99,6 +99,10 @@ If you need stronger boundaries, containerize or sandbox Pi. See [packages/codin
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
 
+## Local fork work
+
+The [Focus specification](.scratch/focus/spec.md) defines this fork's live fullscreen conversation view, behavior, testing requirements, and target-integration boundaries.
+
 ## Development
 
 ```bash

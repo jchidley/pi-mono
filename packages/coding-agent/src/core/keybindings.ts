@@ -52,6 +52,10 @@ const APP_KEYBINDINGS = {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
 	},
+	"app.transcript.toggleFinalOnly": {
+		defaultKeys: [],
+		description: "Toggle fullscreen focus",
+	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",
 		description: "Toggle named session filter",

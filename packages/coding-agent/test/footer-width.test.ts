@@ -122,6 +122,38 @@ describe("FooterComponent width handling", () => {
 		initTheme(undefined, false);
 	});
 
+	it("right-aligns focus beside sorted extension statuses without changing their content", () => {
+		const data = createFooterData(1);
+		const statuses = new Map([
+			["other", "other\nstatus"],
+			["codex", "Cdx"],
+		]);
+		data.getExtensionStatuses = () => statuses;
+		let status: string | undefined = "Focus W:2 E:1";
+		const footer = new FooterComponent(createSession({ sessionName: "" }), data, () => status);
+		expect(stripAnsi(footer.render(40)[2])).toBe("Cdx other status           Focus W:2 E:1");
+		expect(statuses.get("other")).toBe("other\nstatus");
+		status = undefined;
+		expect(stripAnsi(footer.render(40)[2])).toBe("Cdx other status");
+	});
+
+	it.each([0, 1, 2, 5, 12, 13, 15, 20, 40])("keeps native focus status within %s columns", (width) => {
+		const data = createFooterData(1);
+		data.getExtensionStatuses = () => new Map([["wide", "模".repeat(30)]]);
+		const footer = new FooterComponent(createSession({ sessionName: "" }), data, () => "Focus W:2 E:1");
+		const lines = footer.render(width);
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		if (width >= 13) expect(stripAnsi(lines[2])).toMatch(/Focus W:2 E:1$/);
+	});
+
+	it("shows focus on an otherwise empty extension-status row and removes that row on leaving focus", () => {
+		let status: string | undefined = "Focus W:0 E:0";
+		const footer = new FooterComponent(createSession({ sessionName: "" }), createFooterData(1), () => status);
+		expect(stripAnsi(footer.render(20)[2])).toBe("       Focus W:0 E:0");
+		status = undefined;
+		expect(footer.render(20)).toHaveLength(2);
+	});
+
 	it("keeps all lines within width for wide session names", () => {
 		const width = 93;
 		const session = createSession({ sessionName: "한글".repeat(30) });

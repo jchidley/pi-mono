@@ -2,6 +2,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
+import type { ResourceDiagnostic } from "../../../src/core/resource-loader.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness, createTestUiContext } from "../harness.ts";
@@ -31,6 +32,7 @@ type LoadedResourcesContext = {
 			getRegisteredCommands: () => [];
 		};
 	};
+	getLoadedResourceDiagnostics: () => Array<{ label: string; diagnostics: ResourceDiagnostic[] }>;
 	getStartupExpansionState: () => boolean;
 	shouldShowStartupDetails: () => boolean;
 	formatDisplayPath: (resourcePath: string) => string;
@@ -39,6 +41,7 @@ type LoadedResourcesContext = {
 };
 
 type RebindContext = {
+	transcriptPresentation: { refreshConversation: () => void };
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
 	programStatus: { reset(): void };
@@ -51,6 +54,7 @@ type RebindContext = {
 };
 
 type ReloadCommandContext = {
+	transcriptPresentation: { refreshConversation: () => void };
 	hideThinkingBlock: boolean;
 	session: {
 		isStreaming: boolean;
@@ -94,6 +98,9 @@ type ReloadCommandContext = {
 };
 
 type InteractiveModePrototype = {
+	getLoadedResourceDiagnostics(
+		this: LoadedResourcesContext,
+	): Array<{ label: string; diagnostics: ResourceDiagnostic[] }>;
 	showLoadedResources(
 		this: LoadedResourcesContext,
 		options?: { extensions?: Array<{ path: string }>; force?: boolean; showDiagnosticsWhenQuiet?: boolean },
@@ -120,6 +127,7 @@ type ReloadCommandContextOverrides = Omit<
 function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {}): ReloadCommandContext {
 	const editor = overrides.editor ?? {};
 	return {
+		transcriptPresentation: overrides.transcriptPresentation ?? { refreshConversation: () => {} },
 		hideThinkingBlock: overrides.hideThinkingBlock ?? false,
 		session: {
 			isStreaming: false,
@@ -209,6 +217,7 @@ function createLoadedResourcesContext(): LoadedResourcesContext {
 				getRegisteredCommands: () => [],
 			},
 		},
+		getLoadedResourceDiagnostics: interactiveModePrototype.getLoadedResourceDiagnostics,
 		getStartupExpansionState: () => false,
 		shouldShowStartupDetails: () => true,
 		formatDisplayPath: (resourcePath) => resourcePath,
@@ -252,6 +261,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => events.push("apply"),
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -294,6 +304,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -347,6 +358,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				transcriptPresentation: { refreshConversation: () => {} },
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
