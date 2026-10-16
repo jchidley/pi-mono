@@ -81,7 +81,7 @@ describe("InteractiveMode tree navigation availability", () => {
 
 		await select();
 
-		expect(ui.showError).toHaveBeenCalledWith(busyMessage);
+		expect(ui.showError).toHaveBeenCalledWith(busyMessage, "explicit");
 		expect(ui.showStatusIndicator).not.toHaveBeenCalled();
 		expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
 		expect(ui.defaultEditor.onEscape).toBe(onEscape);
@@ -135,7 +135,7 @@ describe("InteractiveMode tree navigation availability", () => {
 		await select();
 
 		expect(ui.session.abort).toHaveBeenCalledOnce();
-		expect(ui.showError).toHaveBeenCalledWith(busyMessage);
+		expect(ui.showError).toHaveBeenCalledWith(busyMessage, "explicit");
 		expect(ui.showStatusIndicator).not.toHaveBeenCalled();
 		expect(ui.clearStatusIndicator).not.toHaveBeenCalled();
 		expect(ui.defaultEditor.onEscape).toBe(onEscape);

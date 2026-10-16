@@ -41,6 +41,6 @@ describe("issue #7443 /model cached match", () => {
 
 		expect(refresh).toHaveBeenCalledOnce();
 		expect(refresh.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
-		expect(context.showStatus).toHaveBeenCalledWith("Refreshing model catalogs…");
+		expect(context.showStatus).toHaveBeenCalledWith("Refreshing model catalogs…", "explicit");
 	});
 });

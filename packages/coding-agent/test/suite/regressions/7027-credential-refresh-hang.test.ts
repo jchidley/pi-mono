@@ -120,6 +120,7 @@ describe("issues #7027 and #7113 credential refresh hang", () => {
 		await vi.advanceTimersByTimeAsync(15_000);
 		expect(showWarning).toHaveBeenCalledWith(
 			"Saved API key for Stalled Login, but its model catalog refresh timed out; using cached models.",
+			"explicit",
 		);
 	});
 });
@@ -163,7 +164,7 @@ describe("post-login model discovery", () => {
 			ui: { requestRender: vi.fn() },
 		};
 		await complete.call(context, "radius", "Radius", "oauth", unknownModel);
-		expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("Credentials saved"));
+		expect(context.showStatus).toHaveBeenCalledWith(expect.stringContaining("Credentials saved"), "explicit");
 		expect(context.showError).not.toHaveBeenCalled();
 		expect(setModel).not.toHaveBeenCalled();
 
@@ -196,7 +197,7 @@ describe("post-login model discovery", () => {
 		const login = await startLogin();
 		await login.discover([]);
 		expect(login.setModel).not.toHaveBeenCalled();
-		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"));
+		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"), "explicit");
 	});
 
 	it("preserves a model selected during refresh", async () => {
@@ -210,8 +211,8 @@ describe("post-login model discovery", () => {
 	it("bounds refresh to 15 seconds", async () => {
 		const login = await startLogin();
 		await vi.advanceTimersByTimeAsync(15_000);
-		expect(login.showWarning).toHaveBeenCalledWith(expect.stringContaining("timed out"));
-		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"));
+		expect(login.showWarning).toHaveBeenCalledWith(expect.stringContaining("timed out"), "explicit");
+		expect(login.showError).toHaveBeenCalledWith(expect.stringContaining("no models are available"), "explicit");
 		expect(login.setModel).not.toHaveBeenCalled();
 	});
 });

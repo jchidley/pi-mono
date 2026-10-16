@@ -14,6 +14,7 @@ type SubmitContext = {
 		prompt: (text: string, options?: unknown) => Promise<void>;
 	};
 	flushPendingBashComponents: () => void;
+	handleFocusCommand: (text: string) => boolean;
 	onInputCallback?: (text: string) => void;
 	pendingUserInputs: string[];
 };
@@ -31,6 +32,7 @@ type StartupSubmitContext = {
 type InteractiveModePrivate = {
 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
+	handleFocusCommand(this: SubmitContext, text: string): boolean;
 	getUserInput(this: InputContext): Promise<string>;
 };
 
@@ -50,6 +52,7 @@ function createSubmitContext(): SubmitContext {
 			prompt: vi.fn(async () => {}),
 		},
 		flushPendingBashComponents: vi.fn(),
+		handleFocusCommand: interactiveModePrototype.handleFocusCommand,
 		pendingUserInputs: [],
 	};
 }
@@ -64,7 +67,7 @@ describe("InteractiveMode startup input", () => {
 		interactiveModePrototype.handleStartupSubmit.call(context, "early prompt");
 
 		expect(context.editor.setText).toHaveBeenCalledWith("early prompt");
-		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress");
+		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress", "explicit");
 	});
 
 	it("queues a normal prompt submitted before the input callback is installed", async () => {

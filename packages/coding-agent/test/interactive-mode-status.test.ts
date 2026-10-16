@@ -5,12 +5,16 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type Component, Container, type Focusable, type TUI } from "../../tui/src/tui.ts";
 import { TuiMainScreen } from "../../tui/src/tui-main-screen.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
+import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
 import type { QuietStartup } from "../src/core/settings-manager.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { TranscriptPresentation } from "../src/modes/interactive/transcript-presentation.ts";
+import * as toolsManager from "../src/utils/tools-manager.ts";
+import { createHarness } from "./suite/harness.ts";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -79,8 +83,18 @@ describe("InteractiveMode.showStatus", () => {
 	});
 
 	test("coalesces immediately-sequential status messages", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			transcriptPresentation: new TranscriptPresentation({
+				header: new Container(),
+				resources: new Container(),
+				transcript: chatContainer,
+				pendingOutput: new Container(),
+				getMarkdownTheme,
+				getOutputPad: () => 1,
+				getMarkdownTransformers: () => [],
+			}),
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
@@ -98,8 +112,18 @@ describe("InteractiveMode.showStatus", () => {
 	});
 
 	test("appends a new status line if something else was added in between", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			transcriptPresentation: new TranscriptPresentation({
+				header: new Container(),
+				resources: new Container(),
+				transcript: chatContainer,
+				pendingOutput: new Container(),
+				getMarkdownTheme,
+				getOutputPad: () => 1,
+				getMarkdownTransformers: () => [],
+			}),
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
@@ -122,24 +146,42 @@ describe("InteractiveMode.showStatus", () => {
 describe("InteractiveMode.showManagedToolStatus", () => {
 	beforeAll(() => initTheme("dark"));
 
-	test("renders tool updates as one contiguous group", () => {
-		const fakeThis: any = {
-			chatContainer: new Container(),
-			ui: { requestRender: vi.fn() },
-			managedToolStatusStarted: false,
-			lastStatusSpacer: undefined,
-			lastStatusText: undefined,
-		};
-		const showManagedToolStatus = (InteractiveMode as any).prototype.showManagedToolStatus;
-
-		showManagedToolStatus.call(fakeThis, { type: "info", message: "fd downloading" });
-		showManagedToolStatus.call(fakeThis, { type: "info", message: "rg downloading" });
-		showManagedToolStatus.call(fakeThis, { type: "warning", message: "rg failed" });
-
-		expect(fakeThis.chatContainer.children).toHaveLength(4);
-		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toBe(
-			"fd downloading\n rg downloading\n Warning: rg failed",
+	test("renders tool updates as one contiguous group", async () => {
+		const installer = vi.spyOn(toolsManager, "ensureTool").mockImplementation(async (tool, onStatus) => {
+			onStatus?.({ type: "info", message: `${tool} downloading` });
+			if (tool === "rg") onStatus?.({ type: "warning", message: "rg failed" });
+			return undefined;
+		});
+		const harness = await createHarness({ settings: { theme: "dark", quietStartup: true } });
+		const terminal = new VirtualTerminal(120, 60);
+		const runtime = new AgentSessionRuntime(
+			harness.session,
+			{
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("Session replacement is outside this managed-tool scenario");
+			},
 		);
+		const mode = new InteractiveMode(runtime, { tuiMode: "fullscreen", terminal });
+		try {
+			await mode.init();
+			await terminal.waitForRender();
+			const output = terminal
+				.getViewport()
+				.map((line) => line.trimEnd())
+				.join("\n");
+			expect(output).toContain(" fd downloading\n rg downloading\n Warning: rg failed");
+		} finally {
+			mode.stop("resume-hint");
+			harness.cleanup();
+			installer.mockRestore();
+		}
 	});
 });
 
@@ -164,7 +206,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(header.setExpanded).toHaveBeenCalledWith(true);
 		expect(loadedResourcesChild.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Tool output: expanded", "background");
 	});
 });
 
@@ -671,6 +713,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 			getCompactExtensionLabels: (extensions: ExtensionFixture[]) =>
 				(InteractiveMode as any).prototype.getCompactExtensionLabels.call(fakeThis, extensions),
 			formatDiagnostics: () => "diagnostics",
+			getLoadedResourceDiagnostics: Reflect.get(InteractiveMode.prototype, "getLoadedResourceDiagnostics"),
 			getBuiltInCommandConflictDiagnostics: () => [],
 		};
 

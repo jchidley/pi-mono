@@ -123,3 +123,20 @@ For release preparation, publishing, verification, or recovery, load and follow 
 ## User Override
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.
+
+## Agent skills
+
+### Issue tracker
+
+For specs and tickets, use the local Markdown tracker. Read
+`docs/agents/issue-tracker.md` before tracker operations.
+
+### Triage labels
+
+For triage, use the five default status names defined in
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+For domain terminology and architecture decisions, use the single-context
+layout described in `docs/agents/domain.md`.

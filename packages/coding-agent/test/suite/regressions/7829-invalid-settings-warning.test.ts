@@ -2,7 +2,8 @@ import { Container } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntimeDiagnostic } from "../../../src/core/agent-session-services.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
-import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, initTheme } from "../../../src/modes/interactive/theme/theme.ts";
+import { TranscriptPresentation } from "../../../src/modes/interactive/transcript-presentation.ts";
 import { createHarness } from "../harness.ts";
 
 function render(container: Container): string {
@@ -28,6 +29,15 @@ describe("issue #7829 invalid settings warning", () => {
 				init: vi.fn(async () => {}),
 				options: { startupDiagnostics },
 				chatContainer,
+				transcriptPresentation: new TranscriptPresentation({
+					header: new Container(),
+					resources: new Container(),
+					transcript: chatContainer,
+					pendingOutput: new Container(),
+					getMarkdownTheme,
+					getOutputPad: () => 1,
+					getMarkdownTransformers: () => [],
+				}),
 				outputPad: 1,
 				ui: { requestRender: vi.fn() },
 				version: "test",
