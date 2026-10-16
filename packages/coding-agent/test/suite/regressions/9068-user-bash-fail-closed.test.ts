@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, UserBashEvent, UserBashEventResult } from "../../../src/core/extensions/types.ts";
+import type { BashExecutionComponent } from "../../../src/modes/interactive/components/bash-execution.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { runRpcMode } from "../../../src/modes/rpc/rpc-mode.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -122,16 +123,23 @@ type InteractiveBashContext = {
 	ui: { requestRender(): void };
 	chatContainer: { addChild(component: unknown): void };
 	pendingMessagesContainer: { addChild(component: unknown): void };
-	pendingBashComponents: unknown[];
+	pendingBashComponents: Map<BashExecutionComponent, "unrecorded" | "deferred" | "persisted">;
 	isBashMode: boolean;
-	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
+	handleBashCommand(command: string, excludeFromContext: boolean, reservation: symbol): Promise<void>;
+	handleFocusCommand(text: string): boolean;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
-	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
+	handleBashCommand(
+		this: InteractiveBashContext,
+		command: string,
+		excludeFromContext: boolean,
+		reservation: symbol,
+	): Promise<void>;
+	handleFocusCommand(this: InteractiveBashContext, text: string): boolean;
 };
 
 const localResult = {
@@ -244,9 +252,10 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			ui: { requestRender: vi.fn() },
 			chatContainer: { addChild: vi.fn() },
 			pendingMessagesContainer: { addChild: vi.fn() },
-			pendingBashComponents: [],
+			pendingBashComponents: new Map(),
 			isBashMode: true,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
+			handleFocusCommand: interactiveModePrototype.handleFocusCommand,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 		};

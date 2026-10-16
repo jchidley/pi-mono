@@ -358,7 +358,7 @@ describe("InteractiveMode copy confirmation", () => {
 
 		await copyCommandPrototype.handleCopyCommand.call(context, { flashConfirmation: true, preferSelection: true });
 
-		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard");
+		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard", "explicit");
 		expect(showError).not.toHaveBeenCalled();
 	});
 });

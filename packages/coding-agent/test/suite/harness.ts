@@ -13,6 +13,7 @@ import type {
 	FauxProviderRegistration,
 	FauxResponseStep,
 	Model,
+	RegisterFauxProviderOptions,
 	ToolResultMessage,
 } from "@earendil-works/pi-ai/compat";
 import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
@@ -111,6 +112,7 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 export interface HarnessOptions {
 	provider?: string;
 	models?: FauxModelDefinition[];
+	fauxStreaming?: Pick<RegisterFauxProviderOptions, "tokensPerSecond" | "tokenSize">;
 	settings?: Partial<Settings>;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
@@ -153,6 +155,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		provider: options.provider,
 		models: options.models,
+		...options.fauxStreaming,
 	});
 	fauxProvider.setResponses([]);
 	const model = fauxProvider.getModel();
