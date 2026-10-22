@@ -77,8 +77,7 @@ function expectChunk(output: string, chunk: string) {
 }
 
 describe("Focus upgrade regressions", () => {
-	// Issues #10267 and #5581: custom-message runs must use before_agent_start.
-	it("keeps custom-message startup busy and hidden until its completed answer arrives", async () => {
+	it("keeps custom-message startup busy until completion (#10267, #5581)", async () => {
 		const started = deferred();
 		const release = deferred();
 		let starts = 0;
@@ -196,8 +195,7 @@ describe("Focus upgrade regressions", () => {
 		}
 	});
 
-	// Issue #10769: unhandled overlay wheel input must reach the selected transcript.
-	it.each([false, true])("scrolls the selected document beneath an unhandled overlay (focus=%s)", async (focused) => {
+	it.each([false, true])("scrolls beneath an unhandled overlay (focus=%s, #10769)", async (focused) => {
 		let close = () => {};
 		const test = await setup({
 			extensionFactories: [
