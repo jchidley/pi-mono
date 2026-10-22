@@ -33,6 +33,12 @@ function fixture({ failure, dirtyBefore = false, dirtyAfter = false, changedHead
 
 const silent = () => {};
 
+test("coding-agent gate includes transcript rebuild and upstream dialog regressions", () => {
+	const check = checks.find(({ name }) => name === "coding-agent");
+	assert.ok(check.args.includes("test/interactive-tui.test.ts"));
+	assert.ok(check.args.includes("test/interactive-mode-extension-dialogs.test.ts"));
+});
+
 test("passes only after every required check and unchanged clean Git state", () => {
 	const f = fixture();
 	const report = validateUpdate("/tmp/repo", f.run, silent);

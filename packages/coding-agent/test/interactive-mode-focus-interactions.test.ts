@@ -8,7 +8,7 @@ import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { FullscreenExitOutput } from "../src/core/settings-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import * as clipboard from "../src/utils/clipboard.ts";
-import { createHarness } from "./suite/harness.ts";
+import { createHarness, type HarnessOptions } from "./suite/harness.ts";
 
 function submit(terminal: VirtualTerminal, text: string) {
 	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
@@ -20,8 +20,12 @@ async function screen(terminal: VirtualTerminal) {
 	return terminal.getViewport().join("\n");
 }
 
-async function setup(exitOutput: FullscreenExitOutput = "resume-hint") {
+async function setup(
+	exitOutput: FullscreenExitOutput = "resume-hint",
+	extensionFactories: HarnessOptions["extensionFactories"] = [],
+) {
 	const harness = await createHarness({
+		extensionFactories,
 		tools: [
 			{
 				name: "echo",
@@ -88,6 +92,49 @@ async function select(terminal: VirtualTerminal, text: string) {
 }
 
 describe("native fullscreen focus interactions", () => {
+	it.each([false, true])(
+		"keeps an open extension dialog answerable across a focus toggle (startedFocused=%s)",
+		async (startedFocused) => {
+			let selected: string | undefined;
+			const test = await setup("resume-hint", [
+				(pi) => {
+					pi.registerCommand("focus-dialog", {
+						description: "Offline focus dialog",
+						handler: async (_args, ctx) => {
+							selected = await ctx.ui.select("Keep this dialog?", ["Keep", "Discard"]);
+						},
+					});
+				},
+			]);
+			let dialog: Promise<void> | undefined;
+			try {
+				if (startedFocused) submit(test.terminal, "/focus");
+				test.terminal.sendInput("\x1b[200~preserved editor draft\x1b[201~");
+				dialog = test.harness.session.prompt("/focus-dialog");
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Keep this dialog?"));
+
+				test.terminal.sendInput("\x1b[17~");
+				const output = await screen(test.terminal);
+				expect(output).toContain("Keep this dialog?");
+				if (startedFocused) expect(output).not.toContain("Focus W:");
+				else expect(output).toContain("Focus W:0 E:0");
+
+				test.terminal.sendInput("\r");
+				await dialog;
+				expect(selected).toBe("Keep");
+				expect(await screen(test.terminal)).not.toContain("Keep this dialog?");
+				test.terminal.sendInput(" after dialog");
+				expect(await screen(test.terminal)).toContain("preserved editor draft after dialog");
+				expect(test.harness.faux.state.callCount).toBe(0);
+				expect(test.harness.session.pendingMessageCount).toBe(0);
+			} finally {
+				test.terminal.sendInput("\x1b");
+				await dialog;
+				test.cleanup();
+			}
+		},
+	);
+
 	it("disables focus when settings switch to regular mode and keeps ordinary view on returning", async () => {
 		const test = await setup();
 		try {

@@ -17,6 +17,7 @@ export const checks = [
 			"test/interactive-mode-focus.test.ts", "test/interactive-mode-focus-lifecycle.test.ts",
 			"test/interactive-mode-focus-output.test.ts", "test/interactive-mode-focus-interactions.test.ts",
 			"test/interactive-mode-focus-upgrade.test.ts", "test/footer-width.test.ts",
+			"test/interactive-tui.test.ts", "test/interactive-mode-extension-dialogs.test.ts",
 		],
 		directory: "packages/coding-agent",
 	},
