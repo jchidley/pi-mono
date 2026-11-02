@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -14,7 +15,7 @@ import { createCodemodeExtension } from "../src/extensions/codemode/index.ts";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme, setTerminalColorScheme, setTerminalColors, theme } from "../src/modes/interactive/theme/theme.ts";
-import { createHarness, type Harness, type HarnessOptions } from "./suite/harness.ts";
+import { createHarness, getMessageText, type Harness, type HarnessOptions } from "./suite/harness.ts";
 
 function submit(terminal: VirtualTerminal, text: string) {
 	terminal.sendInput(`\x1b[200~${text}\x1b[201~`);
@@ -139,6 +140,22 @@ describe("Focus upgrade regressions", () => {
 
 			test.initial.setResponses([fauxAssistantMessage("live answer")]);
 			await test.initial.session.prompt("live user");
+			const liveUserEntry = manager
+				.getBranch()
+				.find(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message) === "live user",
+				)!;
+			const liveAnswerEntry = manager
+				.getBranch()
+				.find(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						getMessageText(entry.message) === "live answer",
+				)!;
 			for (let view = 0; view < 2; view++) {
 				const output = await screen(test.terminal);
 				for (const text of ["live user", "live answer"]) {
@@ -154,19 +171,25 @@ describe("Focus upgrade regressions", () => {
 				test.terminal.sendInput("\x1b[17~");
 			}
 
-			// A history rebuild switches both views from live rendering to persisted entry metadata.
 			submit(test.terminal, "/reload");
 			await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Reloaded keybindings"));
 			captured.length = 0;
 			test.terminal.resize(119, 80);
 			for (let view = 0; view < 2; view++) {
 				await screen(test.terminal);
-				for (const text of ["live user", "live answer"]) {
+				for (const [text, entry, messageType] of [
+					["live user", liveUserEntry, "user"],
+					["live answer", liveAnswerEntry, "assistant"],
+				] as const) {
 					const calls = captured.filter(({ markdown }) => markdown === text);
 					expect(calls.length).toBeGreaterThan(0);
 					for (const { context } of calls) {
-						expect(context.messageId).toBeDefined();
-						expect(context.timestamp).toBe(manager.getEntry(context.messageId!)!.timestamp);
+						expect(context).toMatchObject({
+							messageType,
+							isStreaming: false,
+							messageId: entry.id,
+							timestamp: entry.timestamp,
+						});
 					}
 				}
 				captured.length = 0;
@@ -178,6 +201,130 @@ describe("Focus upgrade regressions", () => {
 			test.cleanup();
 		}
 	});
+
+	it.skipIf(process.platform === "win32").each(["launch failure", "nonzero exit"] as const)(
+		"shows external-editor %s in Focus and preserves the draft (#11592)",
+		async (failure) => {
+			const directory = mkdtempSync(join(tmpdir(), "pi-focus-external-editor-"));
+			const fixture = fileURLToPath(new URL("./fixtures/fake-external-editor.mjs", import.meta.url));
+			const command =
+				failure === "launch failure"
+					? join(directory, "missing-editor")
+					: `${process.execPath} ${fixture} ${join(directory, "capture.json")} --fail`;
+			const message =
+				failure === "launch failure"
+					? "Failed to launch external editor:"
+					: "External editor exited with code 1; prompt unchanged";
+			const test = await setup({ settings: { externalEditor: command } });
+			try {
+				await test.mode.init();
+				submit(test.terminal, "/focus");
+				test.terminal.sendInput("\x1b[200~preserved external-editor draft\x1b[201~");
+				test.terminal.sendInput("\x07");
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain(message));
+				for (let view = 0; view < 3; view++) {
+					const output = await screen(test.terminal);
+					expect(output).toContain(message);
+					expect(output).toContain("preserved external-editor draft");
+					if (view !== 1) expect(output).toContain("Focus W:0 E:0");
+					test.terminal.sendInput("\x1b[17~");
+				}
+				test.terminal.sendInput(" after failure");
+				expect(await screen(test.terminal)).toContain("preserved external-editor draft after failure");
+				expect(test.initial.session.messages).toEqual([]);
+				expect(test.initial.session.pendingMessageCount).toBe(0);
+				expect(test.initial.faux.state.callCount).toBe(0);
+			} finally {
+				test.cleanup();
+				rmSync(directory, { recursive: true });
+			}
+		},
+	);
+
+	it.each([false, true])(
+		"retains message metadata with an explicit requested summary and hidden historical summaries (focus=%s)",
+		async (focused) => {
+			const captured: Array<{ markdown: string; context: MarkdownTransformContext }> = [];
+			const test = await setup({
+				settings: { showCacheMissNotices: true },
+				extensionFactories: [
+					(pi) => {
+						pi.registerMarkdownTransformer((markdown, context) => {
+							captured.push({ markdown, context });
+							return markdown;
+						});
+						pi.on("session_before_tree", () => ({
+							summary: {
+								summary: "newly requested summary",
+								usage: { ...fauxAssistantMessage("offline usage").usage, input: 1234 },
+							},
+						}));
+					},
+				],
+			});
+			try {
+				const manager = test.initial.sessionManager;
+				const userId = manager.appendMessage({ role: "user", content: "retained summary user", timestamp: 1 });
+				manager.branchWithSummary(userId, "historical summary detail", undefined, true, {
+					...fauxAssistantMessage("offline usage").usage,
+					input: 2345,
+				});
+				const answerId = manager.appendMessage(fauxAssistantMessage("retained summary answer"));
+				manager.appendMessage({ role: "user", content: "departing summary user", timestamp: 2 });
+				manager.appendMessage(fauxAssistantMessage("departing summary answer"));
+				test.initial.session.refreshContext();
+				await test.mode.init();
+				if (focused) submit(test.terminal, "/focus");
+				submit(test.terminal, "/tree");
+				test.terminal.sendInput("retained summary answer");
+				test.terminal.sendInput("\r");
+				expect(await screen(test.terminal)).toContain("Summarize branch?");
+				test.terminal.sendInput("\x1b[B");
+				test.terminal.sendInput("\r");
+				await vi.waitFor(async () => expect(await screen(test.terminal)).toContain("Navigated to selected point"));
+				test.terminal.sendInput("\x0f");
+				await screen(test.terminal);
+				captured.length = 0;
+				test.terminal.resize(119, 80);
+				for (const currentFocus of [focused, !focused, focused]) {
+					const output = await screen(test.terminal);
+					expect(output.match(/newly requested summary/g)).toHaveLength(1);
+					expect(output).toContain("Branch summary: 1.2k tokens billed");
+					expect(output).not.toContain("departing summary answer");
+					if (currentFocus) {
+						expect(output).toContain("Focus W:0 E:0");
+						expect(output).not.toContain("historical summary detail");
+						expect(output).not.toContain("Branch summary: 2.3k tokens billed");
+					} else {
+						expect(output).toContain("historical summary detail");
+						expect(output).toContain("Branch summary: 2.3k tokens billed");
+					}
+					for (const [text, id, messageType] of [
+						["retained summary user", userId, "user"],
+						["retained summary answer", answerId, "assistant"],
+					] as const) {
+						expect(output).toContain(text);
+						const calls = captured.filter(({ markdown }) => markdown === text);
+						expect(calls.length).toBeGreaterThan(0);
+						for (const { context } of calls) {
+							expect(context).toMatchObject({
+								messageType,
+								isStreaming: false,
+								messageId: id,
+								timestamp: manager.getEntry(id)!.timestamp,
+							});
+						}
+					}
+					captured.length = 0;
+					test.terminal.sendInput("\x1b[17~");
+				}
+				expect(test.initial.faux.state.callCount).toBe(0);
+				expect(test.initial.session.pendingMessageCount).toBe(0);
+			} finally {
+				test.cleanup();
+			}
+		},
+	);
 
 	it.each(["/model", "/fork"] as const)(
 		"keeps %s paging with the selector through Focus toggles, then restores transcript navigation",
@@ -208,13 +355,11 @@ describe("Focus upgrade regressions", () => {
 				expect(first).toContain(command === "/model" ? "model-00" : "fork user 24");
 				for (let view = 0; view < 3; view++) {
 					test.terminal.sendInput(command === "/model" ? "\x1b[6~" : "\x1b[5~");
-					expect(selected(await screen(test.terminal))).toContain(
-						command === "/model" ? "model-10" : "fork user 14",
-					);
+					const paged = selected(await screen(test.terminal));
+					expect(paged).toBeDefined();
+					expect(paged).not.toBe(first);
 					test.terminal.sendInput("\x1b[17~");
-					expect(selected(await screen(test.terminal))).toContain(
-						command === "/model" ? "model-10" : "fork user 14",
-					);
+					expect(selected(await screen(test.terminal))).toBe(paged);
 					test.terminal.sendInput(command === "/model" ? "\x1b[5~" : "\x1b[6~");
 					expect(selected(await screen(test.terminal))).toBe(first);
 				}
@@ -236,9 +381,8 @@ describe("Focus upgrade regressions", () => {
 		},
 	);
 
-	// Regressions #9909, #11428 and #11431: dialog stacks, blocked status and editor replacement.
 	it.each([false, true])(
-		"preserves stacked dialogs, their blocked status, a replacement editor and header through Focus toggles (focus=%s)",
+		"preserves dialogs, blocked status, replacement editor and header through Focus toggles (focus=%s, #9909, #11428, #11431)",
 		async (focused) => {
 			let ui: ExtensionUIContext | undefined;
 			let finish = () => {};

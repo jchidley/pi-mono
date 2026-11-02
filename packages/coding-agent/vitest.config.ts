@@ -19,7 +19,9 @@ export default mergeConfig(
 				},
 			},
 		},
+		ssr: { resolve: { conditions: ["source"] } },
 		resolve: {
+			conditions: ["source"],
 			alias: [
 				{ find: /^@earendil-works\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex },
 				{ find: /^@earendil-works\/pi-agent-core$/, replacement: workspaceSourcePaths.agentIndex },
